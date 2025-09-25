@@ -145,15 +145,16 @@ INVENTORY_ACTIONS = [
 ]
 
 PROCUREMENT_PAGES = [
-    "requisitions", "purchase_orders", "po_items", "receiving", "goods_receipts", "vendors",
+    "requisitions", "purchase_orders", "po_items", "receiving", "goods_receipts", "vendors", "procurement_audit_logs"
 ]
 
 PROCUREMENT_ACTIONS = [
-    "create_requisition", "approve_requisition", "create_purchase_order", "approve_purchase_order",
-    "create_po_item", "create_receiving", "create_goods_receipt", "add_vendor", "delete_vendor",
-    "update_requisition", "delete_requisition", "update_purchase_order", "delete_purchase_order",
-    "update_po_item", "delete_po_item", "update_receiving", "delete_receiving",
-    "update_goods_receipt", "delete_goods_receipt"
+    "create_requisition", "approve_requisition", "reject_requisition", "update_requisition", "delete_requisition",
+    "create_purchase_order", "approve_purchase_order", "update_purchase_order", "delete_purchase_order",
+    "create_po_item", "update_po_item", "delete_po_item",
+    "create_receiving", "update_receiving", "delete_receiving",
+    "add_vendor", "update_vendor", "delete_vendor",
+    "view_procurement_audit_logs"
 ]
 
 RECEIPT_PAGES = ["receipt_archive", "stock_receipts", "signing_receipts"]
