@@ -33,8 +33,9 @@ DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
 
 ALLOWED_HOSTS = os.environ.get(
     "ALLOWED_HOSTS",
-    "localhost,127.0.0.1,kenyonltd.azurewebsites.net,kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net"
+    "localhost,127.0.0.1,[::1],kenyonltd.azurewebsites.net,kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net,169.254.130.6"
 ).split(",")
+
 
 
 MEDIA_URL = '/media/'
