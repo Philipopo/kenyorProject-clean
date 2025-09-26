@@ -31,7 +31,11 @@ SECRET_KEY = 'django-insecure-=8h1k(&)3!^l(w1j_2ssx*e*5@^1&l7nnad-j5wn7wa7u*6^z7
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
 
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = os.environ.get(
+    "ALLOWED_HOSTS",
+    "localhost,127.0.0.1,kenyonltd.azurewebsites.net,kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net"
+).split(",")
+
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
