@@ -33,6 +33,7 @@ class RequisitionItemSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'unit_cost': 'Unit cost must be positive.'})
         return data
 
+
 class RequisitionSerializer(serializers.ModelSerializer):
     items = RequisitionItemSerializer(many=True, required=False)
     requested_by_name = serializers.CharField(source='requested_by.name', read_only=True)
@@ -41,16 +42,16 @@ class RequisitionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Requisition
         fields = '__all__'
-        read_only_fields = ['code', 'approved_by', 'created_at', 'updated_at', 'approved_at']
+        read_only_fields = [
+            'code', 'approved_by', 'created_at', 'updated_at', 'approved_at',
+            'requested_by', 'created_by'  # ← ADD THESE
+        ]
 
-    def validate(self, data):
-        if self.context['request'].method == 'POST' and data.get('status') == 'submitted':
-            if not data.get('items') or len(data.get('items', [])) == 0:
-                raise serializers.ValidationError({'items': 'At least one item is required for submission.'})
-        return data
-
-    @transaction.atomic
     def create(self, validated_data):
+        # Automatically set requested_by and created_by from request user
+        user = self.context['request'].user
+        validated_data['requested_by'] = user
+        validated_data['created_by'] = user
         items_data = validated_data.pop('items', [])
         requisition = Requisition.objects.create(**validated_data)
         
@@ -59,18 +60,7 @@ class RequisitionSerializer(serializers.ModelSerializer):
         
         return requisition
 
-    @transaction.atomic
-    def update(self, instance, validated_data):
-        items_data = validated_data.pop('items', None)
-        instance = super().update(instance, validated_data)
-        
-        if items_data is not None:
-            # Clear existing items and add new ones
-            instance.items.all().delete()
-            for item_data in items_data:
-                RequisitionItem.objects.create(requisition=instance, **item_data)
-        
-        return instance
+
 
 class POItemSerializer(serializers.ModelSerializer):
     item_details = ItemSerializer(source='item', read_only=True)
