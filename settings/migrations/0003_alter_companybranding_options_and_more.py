@@ -46,7 +46,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='companybranding',
             name='secondary_color',
-            field=models.CharField(default=django.utils.timezone.now, help_text='Hex code', max_length=7),
+            field=models.CharField(default=django.utils.timezone.now, help_text='Hex code', max_length=50),
             preserve_default=False,
         ),
         migrations.AddField(
@@ -62,7 +62,7 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name='companybranding',
             name='primary_color',
-            field=models.CharField(help_text='Hex code, e.g. #1D4ED8', max_length=7),
+            field=models.CharField(help_text='Hex code, e.g. #1D4ED8', max_length=50),
         ),
         migrations.CreateModel(
             name='ActivityLog',

@@ -29,7 +29,7 @@ class Migration(migrations.Migration):
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
                 ('logo', models.ImageField(blank=True, null=True, upload_to='branding/')),
-                ('primary_color', models.CharField(help_text='Hex color code e.g. #1A73E8', max_length=7)),
+                ('primary_color', models.CharField(help_text='Hex color code e.g. #1A73E8', max_length=50)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
                 ('updated_by', models.ForeignKey(null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='branding_updates', to=settings.AUTH_USER_MODEL)),
             ],
