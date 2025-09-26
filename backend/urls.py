@@ -18,17 +18,9 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf.urls.static import static
 from django.conf import settings
-from django.http import HttpResponse
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-
-# simple root view
-def home(request):
-    return HttpResponse("Backend is live and running on Azure")
-
-
 urlpatterns = [
-    path('', home, name='home'),  # ✅ root URL
     path('admin/', admin.site.urls),
     path('api/', include('core.urls')),
     path('api/auth/', include('accounts.urls')),
@@ -43,8 +35,8 @@ urlpatterns = [
     path('api/settings/', include('settings.urls')),
     path('api/alerts/', include('alerts.urls')),
     path('api/warehouse/', include('warehouse.urls')),
-    path('api/chat/', include(('chat.urls', 'chat'), namespace='chat')),
+    path('api/chat/', include('chat.urls', namespace='chat')),
     path('api/activity/', include('activity_log.urls')),
-    path('api/warehouse_new/', include(('warehouse_new.urls', 'warehouse_new'), namespace='warehouse_new')),
+    path('api/warehouse_new/', include('warehouse_new.urls', namespace='warehouse_new')),
     path('api/product-documentation-new/', include('product_documentation_new.urls')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

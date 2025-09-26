@@ -118,13 +118,11 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "https://gray-bay-08d8d431e.1.azurestaticapps.net",
     "https://scm.kenyon-international.com",
-    "https://kenyonltd.azurewebsites.net",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "https://gray-bay-08d8d431e.1.azurestaticapps.net",
     "https://kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net",
-    "https://kenyonltd.azurewebsites.net",
     "https://scm.kenyon-international.com",
 ]
 
