@@ -57,8 +57,8 @@ class Tracker(models.Model):
 class CompanyBranding(models.Model):
     name = models.CharField(max_length=255, help_text="Company name")
     logo = models.ImageField(upload_to='branding_logos/', blank=True, null=True)
-    primary_color = models.CharField(max_length=7, help_text="Hex code, e.g. #1D4ED8")
-    secondary_color = models.CharField(max_length=7, help_text="Hex code")
+    primary_color = models.CharField(max_length=50, help_text="Hex code, e.g. #1D4ED8")
+    secondary_color = models.CharField(max_length=50, help_text="Hex code")
     tagline = models.CharField(max_length=255, blank=True, null=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="brandings")
     created_at = models.DateTimeField(auto_now_add=True)

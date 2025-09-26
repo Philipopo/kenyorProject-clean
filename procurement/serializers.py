@@ -1,11 +1,23 @@
 # procurement/serializers.py
 from rest_framework import serializers
 from django.db import transaction
+from django.contrib.auth import get_user_model
 from .models import (
     Requisition, RequisitionItem, PurchaseOrder, POItem, 
-    Receiving, ReceivingItem, Vendor, ProcurementAuditLog
+    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
 )
 from inventory.serializers import ItemSerializer
+User = get_user_model()
+
+class ApprovalBoardSerializer(serializers.ModelSerializer):
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    added_by_name = serializers.CharField(source='added_by.name', read_only=True)
+    
+    class Meta:
+        model = ApprovalBoard
+        fields = '__all__'
+        read_only_fields = ['added_by', 'added_at']
 
 class VendorSerializer(serializers.ModelSerializer):
     class Meta:
@@ -38,14 +50,16 @@ class RequisitionSerializer(serializers.ModelSerializer):
     items = RequisitionItemSerializer(many=True, required=False)
     requested_by_name = serializers.CharField(source='requested_by.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.name', read_only=True)
+    approved_by_name = serializers.CharField(source='approved_by.name', read_only=True)
     
     class Meta:
         model = Requisition
         fields = '__all__'
         read_only_fields = [
             'code', 'approved_by', 'created_at', 'updated_at', 'approved_at',
-            'requested_by', 'created_by'  # ← ADD THESE
+            'requested_by', 'created_by'
         ]
+
 
     def create(self, validated_data):
         # Automatically set requested_by and created_by from request user

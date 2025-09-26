@@ -19,13 +19,13 @@ class Vendor(models.Model):
     name = models.CharField(max_length=255, unique=True)
     contact_person = models.CharField(max_length=255, blank=True)
     email = models.EmailField(blank=True)
-    phone = models.CharField(max_length=20, blank=True)
+    phone = models.CharField(max_length=50, blank=True)
     address = models.TextField(blank=True)
     tax_id = models.CharField(max_length=50, blank=True, help_text="Tax/VAT registration number")
     details = models.TextField(blank=True, null=True)
     lead_time = models.PositiveIntegerField(help_text="Average lead time in days")
     ratings = models.IntegerField(choices=STAR_CHOICES, default=3)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='active')
     document = models.FileField(upload_to='vendor_documents/', blank=True, null=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='vendors')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -41,6 +41,29 @@ class Vendor(models.Model):
         if self.lead_time <= 0:
             raise ValidationError("Lead time must be positive.")
 
+class ApprovalBoard(models.Model):
+    """Manages users who can approve requisitions and purchase orders"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='approval_board_memberships')
+    can_approve_requisitions = models.BooleanField(default=False)
+    can_approve_purchase_orders = models.BooleanField(default=False)
+    added_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='approval_board_additions')
+    added_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        unique_together = ['user']
+        ordering = ['user__name', 'user__email']
+    
+    def __str__(self):
+        return f"{self.user.email} - Requisitions: {self.can_approve_requisitions}, POs: {self.can_approve_purchase_orders}"
+    
+    def clean(self):
+        if not (self.can_approve_requisitions or self.can_approve_purchase_orders):
+            raise ValidationError("User must be able to approve at least one type of document.")
+
+
+
+
 class Requisition(models.Model):
     STATUS_CHOICES = [
         ('draft', 'Draft'),
@@ -54,8 +77,8 @@ class Requisition(models.Model):
     code = models.CharField(max_length=100, unique=True, blank=True)
     department = models.CharField(max_length=100)
     purpose = models.TextField()
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
-    priority = models.CharField(max_length=20, choices=[
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='draft')
+    priority = models.CharField(max_length=50, choices=[
         ('low', 'Low'),
         ('medium', 'Medium'),
         ('high', 'High'),
@@ -80,15 +103,20 @@ class Requisition(models.Model):
         return f"{self.code}: {self.department} ({self.status})"
 
     def can_approve(self, user):
-        """Check if user can approve this requisition"""
-        return user.role in ['finance_manager', 'operations_manager', 'md', 'admin']
+        """Check if user can approve this requisition using ApprovalBoard"""
+        try:
+            approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
+            return approval_member.can_approve_requisitions
+        except ApprovalBoard.DoesNotExist:
+            return False
+
 
 class RequisitionItem(models.Model):
     requisition = models.ForeignKey(Requisition, on_delete=models.CASCADE, related_name='items')
     item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='requisition_items')
     quantity = models.PositiveIntegerField()
-    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    total_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    unit_cost = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    total_cost = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -122,10 +150,10 @@ class PurchaseOrder(models.Model):
     expected_delivery_date = models.DateField()
     payment_terms = models.TextField(blank=True)
     notes = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
-    total_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
-    tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='draft')
+    total_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0)
+    tax_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0)
+    discount_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0)
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='purchase_orders')
     approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_pos')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -149,7 +177,13 @@ class PurchaseOrder(models.Model):
         return f"{self.code} - {self.vendor.name} ({self.status})"
 
     def can_approve(self, user):
-        return user.role in ['finance_manager', 'operations_manager', 'md', 'admin']
+        """Check if user can approve this purchase order using ApprovalBoard"""
+        try:
+            approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
+            return approval_member.can_approve_purchase_orders
+        except ApprovalBoard.DoesNotExist:
+            return False
+
 
     def is_fully_received(self):
         """Check if all PO items have been received"""

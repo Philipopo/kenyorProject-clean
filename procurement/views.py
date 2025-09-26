@@ -21,19 +21,52 @@ from io import BytesIO
 
 from .models import (
     Requisition, RequisitionItem, PurchaseOrder, POItem, 
-    Receiving, ReceivingItem, Vendor, ProcurementAuditLog
+    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
 )
 from .serializers import (
     RequisitionSerializer, PurchaseOrderSerializer, 
-    ReceivingSerializer, VendorSerializer, ProcurementAuditLogSerializer
+    ReceivingSerializer, VendorSerializer, ProcurementAuditLogSerializer, ApprovalBoardSerializer
 )
 from accounts.permissions import DynamicPermission
 from rest_framework.pagination import PageNumberPagination
+from django.contrib.auth import get_user_model
 
+User = get_user_model()
+
+# Define pagination class FIRST, before any viewsets that use it
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+class ApprovalBoardViewSet(viewsets.ModelViewSet):
+    queryset = ApprovalBoard.objects.select_related('user', 'added_by')
+    serializer_class = ApprovalBoardSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'approval_board'
+    pagination_class = StandardResultsSetPagination
+    required_permissions = {
+        'create': 'add_approval_board_member',
+        'update': 'update_approval_board_member',
+        'partial_update': 'update_approval_board_member',
+        'destroy': 'delete_approval_board_member',
+    }
+
+    def get_queryset(self):
+        queryset = ApprovalBoard.objects.select_related('user', 'added_by').filter(is_active=True)
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(user__email__icontains=search) | 
+                Q(user__name__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(added_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(added_by=self.request.user)
 
 class VendorViewSet(viewsets.ModelViewSet):
     queryset = Vendor.objects.all()
@@ -75,7 +108,9 @@ class RequisitionViewSet(viewsets.ModelViewSet):
     }
 
     def get_queryset(self):
-        queryset = Requisition.objects.select_related('requested_by', 'created_by', 'approved_by')
+        queryset = Requisition.objects.select_related(
+            'requested_by', 'created_by', 'approved_by'
+        ).prefetch_related('items__item')
         search = self.request.query_params.get('search', None)
         if search:
             queryset = queryset.filter(
@@ -84,6 +119,29 @@ class RequisitionViewSet(viewsets.ModelViewSet):
                 Q(purpose__icontains=search)
             )
         return queryset
+
+    @action(detail=False, methods=['get'])
+    def approval_board(self, request):
+        """Get list of users who can approve requisitions"""
+        approval_board = ApprovalBoard.objects.filter(
+            can_approve_requisitions=True,
+            is_active=True
+        ).select_related('user')
+        
+        # Serialize the data
+        data = []
+        for member in approval_board:
+            data.append({
+                'id': member.id,
+                'user_id': member.user.id,
+                'user_email': member.user.email,
+                'user_name': member.user.name,
+                'can_approve_requisitions': member.can_approve_requisitions,
+                'can_approve_purchase_orders': member.can_approve_purchase_orders,
+                'is_active': member.is_active
+            })
+        
+        return Response(data)
 
     def perform_create(self, serializer):
         serializer.save(
