@@ -5,11 +5,19 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db.models import Q, Sum
 from django.http import HttpResponse
-from django.template.loader import get_template
 from django.conf import settings
 import io
-from xhtml2pdf import pisa
 from datetime import datetime
+
+# ReportLab imports for PDF generation (no Cairo needed)
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from io import BytesIO
 
 from .models import (
     Requisition, RequisitionItem, PurchaseOrder, POItem, 
@@ -185,28 +193,127 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def export_pdf(self, request, pk=None):
-        """Export Purchase Order as PDF"""
+        """Export Purchase Order as PDF using reportlab (no Cairo or xhtml2pdf needed)"""
         po = self.get_object()
         
-        # Render HTML template
-        template = get_template('procurement/po_pdf.html')
-        context = {
-            'po': po,
-            'company_name': getattr(settings, 'COMPANY_NAME', 'Your Company'),
-            'company_address': getattr(settings, 'COMPANY_ADDRESS', ''),
-            'company_phone': getattr(settings, 'COMPANY_PHONE', ''),
-            'company_email': getattr(settings, 'COMPANY_EMAIL', ''),
-        }
-        html = template.render(context)
+        # Create a bytes buffer for the PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch
+        )
+        elements = []
         
-        # Generate PDF
-        response = HttpResponse(content_type='application/pdf')
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=16,
+            spaceAfter=12,
+            alignment=1  # center
+        )
+        normal_style = styles['Normal']
+        
+        # === Company Information ===
+        company_name = getattr(settings, 'COMPANY_NAME', 'Your Company')
+        company_address = getattr(settings, 'COMPANY_ADDRESS', '')
+        company_phone = getattr(settings, 'COMPANY_PHONE', '')
+        company_email = getattr(settings, 'COMPANY_EMAIL', '')
+        
+        elements.append(Paragraph(company_name, title_style))
+        if company_address:
+            elements.append(Paragraph(company_address, normal_style))
+        if company_phone:
+            elements.append(Paragraph(f"Phone: {company_phone}", normal_style))
+        if company_email:
+            elements.append(Paragraph(f"Email: {company_email}", normal_style))
+        elements.append(Spacer(1, 14))
+        
+        # === Purchase Order Header ===
+        elements.append(Paragraph(f"Purchase Order #{po.code}", 
+                                 ParagraphStyle('POHeader', parent=styles['Heading2'], fontSize=14)))
+        elements.append(Spacer(1, 12))
+        
+        # === PO Details Table ===
+        po_data = [
+            ["Date:", po.created_at.strftime('%Y-%m-%d')],
+            ["Department:", po.department or "N/A"],
+            ["Vendor:", po.vendor.name if po.vendor else "N/A"],
+            ["Status:", po.get_status_display()],
+        ]
+        if po.approved_at:
+            po_data.append(["Approved At:", po.approved_at.strftime('%Y-%m-%d')])
+        
+        po_table = Table(po_data, colWidths=[1.8 * inch, 4.0 * inch])
+        po_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(po_table)
+        elements.append(Spacer(1, 18))
+        
+        # === Items Section ===
+        elements.append(Paragraph("Items", ParagraphStyle('ItemsHeader', parent=styles['Heading3'])))
+        elements.append(Spacer(1, 6))
+        
+        # Table header
+        item_data = [["Item", "Description", "Qty", "Unit Price", "Total"]]
+        
+        # Add each PO item
+        for item in po.items.all():
+            total = item.quantity * item.unit_price
+            item_data.append([
+                item.item.name if item.item else "N/A",
+                item.description or "",
+                str(item.quantity),
+                f"{item.unit_price:.2f}",
+                f"{total:.2f}"
+            ])
+        
+        # Add total row
+        total_amount = sum(item.quantity * item.unit_price for item in po.items.all())
+        item_data.append(["", "", "", "Total:", f"{total_amount:.2f}"])
+        
+        # Create and style items table
+        item_table = Table(
+            item_data,
+            colWidths=[1.2 * inch, 2.3 * inch, 0.6 * inch, 0.8 * inch, 0.8 * inch]
+        )
+        item_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('ALIGN', (-2, 1), (-1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -2), 0.5, colors.grey),
+            ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(item_table)
+        elements.append(Spacer(1, 24))
+        
+        # Optional: Add notes or footer
+        if po.notes:
+            elements.append(Paragraph("<b>Notes:</b>", ParagraphStyle('NotesHeader', parent=styles['Normal'], fontName='Helvetica-Bold')))
+            elements.append(Paragraph(po.notes, normal_style))
+        
+        # Build PDF
+        doc.build(elements)
+        
+        # Prepare HTTP response
+        buffer.seek(0)
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="PO_{po.code}.pdf"'
-        
-        pisa_status = pisa.CreatePDF(html, dest=response)
-        if pisa_status.err:
-            return Response({'error': 'Error generating PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
         return response
 
 class ReceivingViewSet(viewsets.ModelViewSet):
