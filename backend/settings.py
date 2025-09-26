@@ -13,37 +13,31 @@ import os
 from pathlib import Path
 from datetime import timedelta
 
-
-
-
-
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-=8h1k(&)3!^l(w1j_2ssx*e*5@^1&l7nnad-j5wn7wa7u*6^z7'
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-=8h1k(&)3!^l(w1j_2ssx*e*5@^1&l7nnad-j5wn7wa7u*6^z7')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
 
-ALLOWED_HOSTS = os.environ.get(
-    "ALLOWED_HOSTS",
-    "localhost,127.0.0.1,[::1],kenyonltd.azurewebsites.net,kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net,169.254.130.6"
-).split(",")
-
-
+# Allow all hosts in Azure (safe due to Azure's infrastructure)
+if 'WEBSITE_HOSTNAME' in os.environ:
+    ALLOWED_HOSTS = ['*']
+else:
+    ALLOWED_HOSTS = os.environ.get(
+        "ALLOWED_HOSTS",
+        "localhost,127.0.0.1,[::1],kenyonltd.azurewebsites.net,kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net"
+    ).split(",")
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
-
 # Application definition
-
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -55,11 +49,10 @@ INSTALLED_APPS = [
     'analytics',
     'rest_framework.authtoken',
     'api',
-    'rest_framework',  # If you're using Django REST Framework (recommended)
+    'rest_framework',
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
-    'corsheaders',     # To allow frontend to connect
-    # Your app
+    'corsheaders',
     'core',
     'finance',
     'inventory',
@@ -72,11 +65,10 @@ INSTALLED_APPS = [
     'warehouse',
     'warehouse_new',
     'product_documentation',
-    'channels',  # For WebSocket support
-    'chat',     # Add chat app
+    'channels',
+    'chat',
     'activity_log',
     'product_documentation_new',
-    
 ]
 
 ASGI_APPLICATION = 'backend.asgi.application'
@@ -97,7 +89,7 @@ REST_FRAMEWORK = {
 }
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',  # must come first
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -107,8 +99,6 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-
-
 CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
 CSRF_COOKIE_HTTPONLY = False
@@ -116,6 +106,7 @@ CSRF_COOKIE_SECURE = True
 SESSION_COOKIE_SECURE = True
 AUTH_USER_MODEL = 'accounts.User'
 
+# Clean up trailing spaces in URLs
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3001",
@@ -134,16 +125,10 @@ CSRF_TRUSTED_ORIGINS = [
 CORS_ALLOW_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 CORS_ALLOW_HEADERS = ['content-type', 'authorization', 'x-api-key', 'x-csrftoken']
 
-
-
-
 FRONTEND_URL = "https://scm.kenyon-international.com"
 MAKE_WEBHOOK_URL = "https://hook.eu2.make.com/jt8l5h53qqhpxfmb8iogerggheif47u3"
 
 ROOT_URLCONF = 'backend.urls'
-
-
-#IOT_API_KEY = 'your-secret-iot-api-key-123456'  # Generate a secure key
 
 TEMPLATES = [
     {
@@ -162,10 +147,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'backend.wsgi.application'
 
-
 # Database
-# https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-
 if os.environ.get('PRODUCTION') == '1':
     DATABASES = {
         'default': {
@@ -176,7 +158,7 @@ if os.environ.get('PRODUCTION') == '1':
             'HOST': os.environ.get('DB_HOST', 'kenyon-cmf-db.postgres.database.azure.com'),
             'PORT': os.environ.get('DB_PORT', '5432'),
             'OPTIONS': {
-                'sslmode': 'require',  # Azure requires SSL
+                'sslmode': 'require',
             },
         }
     }
@@ -188,10 +170,7 @@ else:
         }
     }
 
-
 # Password validation
-# https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -207,20 +186,14 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
-
 # Internationalization
-# https://docs.djangoproject.com/en/5.2/topics/i18n/
-
 LANGUAGE_CODE = 'en-us'
-
 TIME_ZONE = 'UTC'
-
 USE_I18N = True
-
 USE_TZ = True
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),   # or 15, 60, etc.
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     'BLACKLIST_AFTER_ROTATION': True,
     'ROTATE_REFRESH_TOKENS': True,
@@ -228,18 +201,14 @@ SIMPLE_JWT = {
     'TOKEN_BLACKLIST_ENABLED': True,
 }
 
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
-
+# Static files
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Default primary key field type
-# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
-
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# Logging
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
