@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.db import transaction
-from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem
+from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem, InventoryActivityLog
 import logging
 
 logger = logging.getLogger(__name__)
@@ -43,87 +43,10 @@ class WarehouseSerializer(serializers.ModelSerializer):
                 'type': bin.type,
                 'capacity': bin.capacity,
                 'current_load': bin.current_load,
-                'usage_percentage': bin.usage_percentage,  # Now works!
+                'usage_percentage': bin.usage_percentage,
                 'description': bin.description
             })
         return locations
-
-class StorageBinSerializer(serializers.ModelSerializer):
-    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
-    warehouse_code = serializers.CharField(source='warehouse.code', read_only=True)
-    usage_percentage = serializers.SerializerMethodField()
-    created_by = serializers.SerializerMethodField()
-    location_display = serializers.SerializerMethodField()
-
-    class Meta:
-        model = StorageBin
-        fields = [
-            'id', 'warehouse', 'warehouse_name', 'warehouse_code', 'bin_id',
-            'row', 'rack', 'shelf', 'type', 'capacity', 'current_load',
-            'description', 'usage_percentage', 'created_by', 'location_display',
-            'created_at', 'updated_at'
-        ]
-        read_only_fields = ['user', 'current_load', 'created_at', 'updated_at']
-
-    def get_usage_percentage(self, obj):
-        if obj.capacity == 0:
-            return 0
-        return round((obj.current_load / obj.capacity) * 100, 2)
-
-    def get_created_by(self, obj):
-        if obj.user:
-            return obj.user.name or obj.user.email
-        return '—'
-
-    def get_location_display(self, obj):
-        location = f"Row {obj.row}, Rack {obj.rack}"
-        if obj.shelf:
-            location += f", Shelf {obj.shelf}"
-        return location
-
-    def validate(self, data):
-        # Validate that bin_id is unique
-        if 'bin_id' in data:
-            queryset = StorageBin.objects.filter(bin_id=data['bin_id'])
-            if self.instance:
-                queryset = queryset.exclude(pk=self.instance.pk)
-            if queryset.exists():
-                raise serializers.ValidationError({"bin_id": "Bin ID must be unique."})
-        
-        # NEW: Prevent assigning bin to multiple warehouses
-        if 'warehouse' in data and data['warehouse']:
-            bin_id = data.get('bin_id')
-            if bin_id:
-                existing_bin = StorageBin.objects.filter(
-                    bin_id=bin_id
-                ).exclude(
-                    pk=getattr(self.instance, 'pk', None)
-                ).first()
-                if existing_bin and existing_bin.warehouse and existing_bin.warehouse != data['warehouse']:
-                    raise serializers.ValidationError({
-                        "warehouse": f"Bin {bin_id} already belongs to warehouse '{existing_bin.warehouse.name}'. Remove it first."
-                    })
-        
-        # Validate warehouse-row-rack-shelf uniqueness
-        warehouse = data.get('warehouse', getattr(self.instance, 'warehouse', None))
-        row = data.get('row', getattr(self.instance, 'row', None))
-        rack = data.get('rack', getattr(self.instance, 'rack', None))
-        shelf = data.get('shelf', getattr(self.instance, 'shelf', ''))
-        
-        if warehouse and row and rack:
-            queryset = StorageBin.objects.filter(
-                warehouse=warehouse, row=row, rack=rack, shelf=shelf
-            )
-            if self.instance:
-                queryset = queryset.exclude(pk=self.instance.pk)
-            if queryset.exists():
-                raise serializers.ValidationError({
-                    "location": "A bin already exists at this location in the warehouse."
-                })
-        
-        return data
-
-        
 
 class ItemSerializer(serializers.ModelSerializer):
     total_quantity = serializers.SerializerMethodField()
@@ -157,14 +80,134 @@ class ItemSerializer(serializers.ModelSerializer):
             return user.name or user.email
         return '—'
 
+    def validate_reserved_quantity(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Reserved quantity cannot be negative.")
+        
+        instance = getattr(self, 'instance', None)
+        
+        if instance:
+            total_qty = instance.total_quantity()
+            if value > total_qty:
+                raise serializers.ValidationError(
+                    f"Reserved quantity ({value}) cannot exceed total stock ({total_qty}). "
+                    f"Please add stock inflow first."
+                )
+        else:
+            if value > 0:
+                raise serializers.ValidationError(
+                    "Reserved quantity must be 0 for new items. Please add stock inflow first."
+                )
+        
+        return value
+
+    def validate(self, data):
+        reserved_qty = data.get('reserved_quantity', getattr(self.instance, 'reserved_quantity', 0))
+        
+        if self.instance:
+            total_qty = self.instance.total_quantity()
+            if reserved_qty > total_qty:
+                raise serializers.ValidationError({
+                    'reserved_quantity': f"Reserved quantity ({reserved_qty}) cannot exceed total stock ({total_qty}). Please add stock inflow first."
+                })
+        
+        return data
+
+
+        
 class StockRecordSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
     storage_bin_id = serializers.CharField(source='storage_bin.bin_id', read_only=True)
+    item = ItemSerializer(read_only=True)  # This includes all item fields
 
     class Meta:
         model = StockRecord
         fields = ['id', 'item', 'item_name', 'storage_bin', 'storage_bin_id', 'quantity', 'user', 'created_at']
         read_only_fields = ['user', 'item_name', 'storage_bin_id', 'created_at']
+
+
+
+class StorageBinSerializer(serializers.ModelSerializer):
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
+    warehouse_code = serializers.CharField(source='warehouse.code', read_only=True)
+    usage_percentage = serializers.SerializerMethodField()
+    created_by = serializers.SerializerMethodField()
+    location_display = serializers.SerializerMethodField()
+    # Remove the redundant source parameter and include full stock records
+    stock_records = StockRecordSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = StorageBin
+        fields = [
+            'id', 'warehouse', 'warehouse_name', 'warehouse_code', 'bin_id',
+            'row', 'rack', 'shelf', 'type', 'capacity', 'current_load',
+            'description', 'usage_percentage', 'created_by', 'location_display',
+            'created_at', 'updated_at', 'stock_records'
+        ]
+        read_only_fields = ['user', 'current_load', 'created_at', 'updated_at']
+
+        
+
+    def get_usage_percentage(self, obj):
+        if obj.capacity == 0:
+            return 0
+        return round((obj.current_load / obj.capacity) * 100, 2)
+
+    def get_created_by(self, obj):
+        if obj.user:
+            return obj.user.name or obj.user.email
+        return '—'
+
+    def get_location_display(self, obj):
+        location = f"Row {obj.row}, Rack {obj.rack}"
+        if obj.shelf:
+            location += f", Shelf {obj.shelf}"
+        return location
+
+    def validate(self, data):
+        # Validate that bin_id is unique
+        if 'bin_id' in data:
+            queryset = StorageBin.objects.filter(bin_id=data['bin_id'])
+            if self.instance:
+                queryset = queryset.exclude(pk=self.instance.pk)
+            if queryset.exists():
+                raise serializers.ValidationError({"bin_id": "Bin ID must be unique."})
+        
+        # Prevent assigning bin to multiple warehouses
+        if 'warehouse' in data and data['warehouse']:
+            bin_id = data.get('bin_id')
+            if bin_id:
+                existing_bin = StorageBin.objects.filter(
+                    bin_id=bin_id
+                ).exclude(
+                    pk=getattr(self.instance, 'pk', None)
+                ).first()
+                if existing_bin and existing_bin.warehouse and existing_bin.warehouse != data['warehouse']:
+                    raise serializers.ValidationError({
+                        "warehouse": f"Bin {bin_id} already belongs to warehouse '{existing_bin.warehouse.name}'. Remove it first."
+                    })
+        
+        # Validate warehouse-row-rack-shelf uniqueness
+        warehouse = data.get('warehouse', getattr(self.instance, 'warehouse', None))
+        row = data.get('row', getattr(self.instance, 'row', None))
+        rack = data.get('rack', getattr(self.instance, 'rack', None))
+        shelf = data.get('shelf', getattr(self.instance, 'shelf', ''))
+        
+        if warehouse and row and rack:
+            queryset = StorageBin.objects.filter(
+                warehouse=warehouse, row=row, rack=rack, shelf=shelf
+            )
+            if self.instance:
+                queryset = queryset.exclude(pk=self.instance.pk)
+            if queryset.exists():
+                raise serializers.ValidationError({
+                    "location": "A bin already exists at this location in the warehouse."
+                })
+        
+        return data
+
+
+
 
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
@@ -203,7 +246,6 @@ class ExpiryTrackedItemSerializer(serializers.ModelSerializer):
         model = ExpiryTrackedItem
         fields = ['id', 'item', 'item_name', 'batch', 'quantity', 'expiry_date', 'user', 'created_at']
         read_only_fields = ['user', 'created_at', 'item_name']
-        
 
 class StockInSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
@@ -252,7 +294,6 @@ class StockInSerializer(serializers.Serializer):
             stock_record.quantity += quantity
             stock_record.save()
 
-            # Update bin current load
             storage_bin.current_load += quantity
             storage_bin.save()
 
@@ -327,7 +368,6 @@ class StockOutSerializer(serializers.Serializer):
             else:
                 stock_record.save()
 
-            # Update bin current load
             storage_bin.current_load = max(0, storage_bin.current_load - quantity)
             storage_bin.save()
 
@@ -341,3 +381,12 @@ class StockOutSerializer(serializers.Serializer):
             )
 
             logger.info(f"Stock Out: {quantity} of {item.name} from {storage_bin.bin_id} by {self.context['request'].user.email}")
+
+class InventoryActivityLogSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    
+    class Meta:
+        model = InventoryActivityLog
+        fields = '__all__'
+        read_only_fields = ['user', 'timestamp']

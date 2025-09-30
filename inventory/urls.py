@@ -4,7 +4,7 @@ from .views import (
     WarehouseViewSet, WarehouseAnalyticsView,
     StorageBinViewSet, ItemViewSet, StockRecordViewSet,
     StockMovementViewSet, InventoryAlertViewSet, ExpiryTrackedItemViewSet,
-    StockInView, StockOutView, InventoryMetricsView, AnalyticsView
+    StockInView, StockOutView, InventoryMetricsView, AnalyticsView, InventoryActivityLogViewSet, ImportCSVView
 )
 
 router = DefaultRouter()
@@ -15,8 +15,10 @@ router.register('stocks', StockRecordViewSet, basename='stocks')
 router.register('movements', StockMovementViewSet, basename='movements')
 router.register('alerts', InventoryAlertViewSet, basename='alerts')
 router.register('expiry-tracked-items', ExpiryTrackedItemViewSet, basename='expiry-tracked-items')
+router.register('activity-logs', InventoryActivityLogViewSet, basename='activity-logs')
 
 urlpatterns = [
+    path('items/import-csv/', ImportCSVView.as_view(), name='import-items-csv'),  # ADD THIS LINE
     path('', include(router.urls)),
     path('metrics/', InventoryMetricsView.as_view(), name='inventory-metrics'),
     path('stock-in/', StockInView.as_view(), name='stock-in'),

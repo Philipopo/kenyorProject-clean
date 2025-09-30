@@ -124,24 +124,26 @@ PERMISSION_ROLES = {
 
 INVENTORY_PAGES = [
     'inventory_metrics',
-    'storage_bins',
-    'expired_items',
-    'items',
-    'stock_records',
-    'expiry_tracked_items',
-    'aisle_rack_dashboard',
-    'update_expiry_tracked_item',
-    'delete_expiry_tracked_item',  # Added
+    'storage_bins', 
+    'expired_items', 
+    'items', 
+    'stock_records', 
+    'expiry_tracked_items', 
+    'aisle_rack_dashboard', 
+    'update_expiry_tracked_item', 
+    'delete_expiry_tracked_item', 'inventory_activity_logs',
+    'stock_movements',  
+    'import_items_csv',  
 ]
 
+# Add to INVENTORY_ACTIONS  
 INVENTORY_ACTIONS = [
     'create_storage_bin', 'create_item', 'create_stock_record', 'create_expiry_tracked_item',
     'update_storage_bin', 'update_item', 'update_stock_record', 'update_expiry_tracked_item',
     'delete_item', 'delete_storage_bin', 'delete_stock_record', 'delete_expiry_tracked_item',
-     'generate_api_key',  # Added
-    'view_api_key',      # Added
-    'delete_api_key',
-    'create_warehouse', 'update_warehouse', 'delete_warehouse', 
+    'generate_api_key', 'view_api_key', 'delete_api_key',
+    'create_warehouse', 'update_warehouse', 'delete_warehouse',
+    'stock_in', 'stock_out', 'import_items_csv'
 ]
 
 PROCUREMENT_PAGES = [
@@ -162,8 +164,12 @@ RECEIPT_ACTIONS = [
     "create_receipt", "create_stock_receipt", "create_signing_receipt",
     "update_receipt", "delete_receipt",  # Added
     "update_stock_receipt", "delete_stock_receipt",  # Added
-    "update_signing_receipt", "delete_signing_receipt"  # Added
+    "update_signing_receipt", "delete_signing_receipt",'add_receipt_approver',
+    'remove_receipt_approver',
+    'sign_receipt',    # Added
 ]
+
+
 
 FINANCE_PAGES = ["finance_categories", "finance_transactions", "finance_overview"]
 FINANCE_ACTIONS = [
@@ -172,16 +178,32 @@ FINANCE_ACTIONS = [
     "update_finance_transaction", "delete_finance_transaction",
 ]
 
-RENTALS_PAGES = ["rentals_active", "rentals_equipment", "rentals_payments"]
-RENTALS_ACTIONS = ["create_rental", "update_rental", "delete_rental", "create_equipment", "create_payment"]
+RENTALS_PAGES = ["rentals_active", "rentals_equipment", "rentals_payments", "branches"]
+RENTALS_ACTIONS = ["create_rental", "update_rental", "delete_rental", "create_equipment", "create_payment", "create_branch", "update_branch", "delete_branch"]
 
 ANALYTICS_PAGES = ["analytics_dwell", "analytics_eoq", "analytics_stock"]
 ANALYTICS_ACTIONS = ["create_dwell", "create_eoq", "create_stock_analytics"]
 
-PRODUCT_DOCUMENTATION_PAGES = ["product_documentation", "product_inflow", "product_outflow"]
+PRODUCT_DOCUMENTATION_PAGES = [
+    "product_documentation",        # Main page (list inflows/outflows)
+    "product_inflow",               # Inflow list/detail
+    "product_outflow",              # Outflow list/detail
+    "product_documentation_logs",   # Activity logs page
+]
+
 PRODUCT_DOCUMENTATION_ACTIONS = [
-    "create_product_inflow", "update_product_inflow", "delete_product_inflow",
-    "create_product_outflow", "update_product_outflow", "delete_product_outflow",
+    # Inflow actions
+    "create_product_inflow",
+    "update_product_inflow",
+    "delete_product_inflow",
+    
+    # Outflow actions
+    "create_product_outflow",
+    "update_product_outflow",
+    "delete_product_outflow",
+    
+    # Log viewing (read-only, so lower permission)
+    "view_product_documentation_logs",
 ]
 
 PRODUCT_DOCUMENTATION_NEW_PAGES = ["product_documentation_new", "product_inflow_new", "product_outflow_inflow_new"]

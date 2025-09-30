@@ -1,103 +1,124 @@
+# rentals/serializers.py
 from rest_framework import serializers
-from .models import Equipment, Rental, RentalPayment
+from .models import Equipment, Rental, RentalPayment, Branch
 from django.contrib.auth import get_user_model
-import logging  # Add this import
-
-logger = logging.getLogger(__name__)  # Define logger
 
 User = get_user_model()
 
+
+class BranchSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Branch
+        fields = ['id', 'name', 'code', 'address', 'created_by', 'created_by_name', 'created_at']
+        read_only_fields = ['created_by', 'created_by_name', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
+
+
 class EquipmentSerializer(serializers.ModelSerializer):
-    created_by_name = serializers.CharField(source='created_by.full_name', read_only=True, default='N/A')
+    created_by_name = serializers.SerializerMethodField()
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
 
     class Meta:
         model = Equipment
-        fields = ['id', 'name', 'category', 'condition', 'location', 'created_by', 'created_at', 'created_by_name']
-        read_only_fields = ['created_by', 'created_at', 'created_by_name']
+        fields = [
+            'id', 'name', 'category', 'condition', 'location', 'branch', 'branch_name',
+            'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['created_by', 'created_by_name', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
 
     def validate(self, data):
-        if not data.get('name') or not data.get('category') or not data.get('condition') or not data.get('location'):
-            raise serializers.ValidationError('All fields are required.')
-        return data
-
-class RentalSerializer(serializers.ModelSerializer):
-    renter_name = serializers.CharField(source='renter.full_name', read_only=True, default='N/A')
-    equipment_name = serializers.CharField(source='equipment.name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.full_name', read_only=True, default='N/A')
-    equipment = serializers.PrimaryKeyRelatedField(queryset=Equipment.objects.all())
-
-    class Meta:
-        model = Rental
-        fields = ['id', 'code', 'renter', 'renter_name', 'equipment', 'equipment_name', 'start_date', 'due_date', 'status', 'created_by', 'created_at', 'created_by_name']
-        read_only_fields = ['id', 'code', 'renter', 'created_by', 'created_at', 'created_by_name', 'renter_name', 'equipment_name']
-
-    def validate(self, data):
-        # Log incoming data for debugging
-        logger.debug(f"Validating rental data: {data}")
-
-        # Validate required fields
-        required_fields = ['equipment', 'start_date', 'due_date', 'status']
-        for field in required_fields:
+        required = ['name', 'category', 'condition', 'location', 'branch']
+        for field in required:
             if not data.get(field):
-                logger.error(f"Missing required field: {field}")
-                raise serializers.ValidationError({field: f'{field.replace("_", " ").title()} is required.'})
-
-        # Validate dates
-        if data.get('start_date') > data.get('due_date'):
-            logger.error(f"Invalid dates: start_date={data.get('start_date')} > due_date={data.get('due_date')}")
-            raise serializers.ValidationError({'due_date': 'Due date must be after start date.'})
-
-        # Validate equipment
-        equipment = data.get('equipment')
-        if not isinstance(equipment, Equipment):
-            try:
-                equipment = Equipment.objects.get(id=equipment)
-            except Equipment.DoesNotExist:
-                logger.error(f"Invalid equipment ID: {equipment}")
-                raise serializers.ValidationError({'equipment': 'Equipment does not exist.'})
-            except ValueError:
-                logger.error(f"Invalid equipment value: {equipment}")
-                raise serializers.ValidationError({'equipment': 'Equipment ID must be a number.'})
-
-        # Ensure equipment is an instance for consistency
-        data['equipment'] = equipment
-
+                raise serializers.ValidationError(f"{field.replace('_', ' ').title()} is required.")
         return data
 
     def create(self, validated_data):
-        request = self.context.get('request')
-        if not request or not hasattr(request, 'user') or not request.user.is_authenticated:
-            logger.error("Unauthenticated user attempted to create rental")
-            raise serializers.ValidationError({'renter': 'Authenticated user required.'})
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
 
-        # Ensure user has full_name
-        if not hasattr(request.user, 'full_name') or not request.user.full_name:
-            logger.error(f"User {request.user.username} has no full_name")
-            raise serializers.ValidationError({'renter': 'User must have a full name.'})
 
+class RentalSerializer(serializers.ModelSerializer):
+    renter_name = serializers.SerializerMethodField()
+    equipment_name = serializers.CharField(source='equipment.name', read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    approved_by_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Rental
+        fields = [
+            'id', 'code', 'renter', 'renter_name', 'equipment', 'equipment_name',
+            'branch', 'branch_name', 'start_date', 'due_date',
+            'approved_by', 'approved_by_name', 'returned', 'returned_at',
+            'status', 'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = [
+            'id', 'code', 'renter', 'branch', 'created_by', 'created_by_name',
+            'renter_name', 'equipment_name', 'branch_name', 'approved_by_name'
+        ]
+
+    def get_renter_name(self, obj):
+        if obj.renter:
+            return obj.renter.full_name or obj.renter.name or obj.renter.email
+        return "N/A"
+
+    def get_approved_by_name(self, obj):
+        if obj.approved_by:
+            return obj.approved_by.full_name or obj.approved_by.name or obj.approved_by.email
+        return "N/A"
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
+
+    def validate(self, data):
+        required = ['equipment', 'start_date', 'due_date', 'status']
+        for field in required:
+            if not data.get(field):
+                raise serializers.ValidationError(f"{field.replace('_', ' ').title()} is required.")
+        if data['start_date'] > data['due_date']:
+            raise serializers.ValidationError("Due date must be after start date.")
+        return data
+
+    def create(self, validated_data):
+        request = self.context['request']
         validated_data['renter'] = request.user
         validated_data['created_by'] = request.user
+        return super().create(validated_data)
 
-        try:
-            rental = Rental.objects.create(**validated_data)
-            if not rental.code:
-                rental.code = f"RENT-{rental.id:06d}"
-                rental.save(update_fields=['code'])
-            logger.debug(f"Created rental: {rental.code}")
-            return rental
-        except Exception as e:
-            logger.error(f"Failed to create rental: {str(e)}")
-            raise serializers.ValidationError(f"Failed to create rental: {str(e)}")
 
 class RentalPaymentSerializer(serializers.ModelSerializer):
-    renter_name = serializers.CharField(source='rental.renter.full_name', read_only=True, default='N/A')
+    renter_name = serializers.SerializerMethodField()
     equipment_name = serializers.CharField(source='rental.equipment.name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.full_name', read_only=True, default='N/A')
+    created_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = RentalPayment
         fields = ['id', 'rental', 'renter_name', 'equipment_name', 'amount_paid', 'payment_date', 'status', 'created_by', 'created_at', 'created_by_name']
         read_only_fields = ['payment_date', 'created_by', 'created_at', 'created_by_name']
+
+    def get_renter_name(self, obj):
+        if obj.rental and obj.rental.renter:
+            return obj.rental.renter.full_name or obj.rental.renter.name or obj.rental.renter.email
+        return "N/A"
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
 
     def validate(self, data):
         if data.get('amount_paid', 0) <= 0:

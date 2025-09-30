@@ -102,16 +102,14 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = [
             'code', 'total_amount', 'approved_by', 'created_at', 
-            'updated_at', 'approved_at'
+            'updated_at', 'approved_at', 'created_by'  # Add created_by
         ]
 
     def validate(self, data):
-        # Ensure vendor is selected
         if not data.get('vendor'):
             raise serializers.ValidationError({'vendor': 'Vendor is required.'})
         
-        # Ensure items are provided for submission
-        if self.context['request'].method == 'POST' and data.get('status') != 'draft':
+        if self.context['request'].method == 'POST' and data.get('status', 'draft') != 'draft':
             if not self.initial_data.get('items') or len(self.initial_data.get('items', [])) == 0:
                 raise serializers.ValidationError({'items': 'At least one item is required.'})
         
@@ -120,12 +118,20 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
+        validated_data['created_by'] = self.context['request'].user  # Set created_by
         po = PurchaseOrder.objects.create(**validated_data)
         
         total_amount = 0
-        for item_data in items_data:
-            po_item = POItem.objects.create(po=po, **item_data)
-            total_amount += po_item.total_price
+        for index, item_data in enumerate(items_data):
+            try:
+                if 'item' not in item_data:
+                    raise serializers.ValidationError({'item': 'This field is required.'})
+                po_item = POItem.objects.create(po=po, **item_data)
+                total_amount += po_item.total_price
+            except Exception as e:
+                raise serializers.ValidationError({
+                    'items': f'Error in item {index + 1}: {str(e)}'
+                })
         
         po.total_amount = total_amount
         po.save()
@@ -137,15 +143,25 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         instance = super().update(instance, validated_data)
         
         if items_data is not None:
-            # Update total amount
+            instance.items.all().delete()
             total_amount = 0
-            for item_data in items_data:
-                po_item = POItem.objects.create(po=instance, **item_data)
-                total_amount += po_item.total_price
+            for index, item_data in enumerate(items_data):
+                try:
+                    if 'item' not in item_data:
+                        raise serializers.ValidationError({'item': 'This field is required.'})
+                    po_item = POItem.objects.create(po=instance, **item_data)
+                    total_amount += po_item.total_price
+                except Exception as e:
+                    raise serializers.ValidationError({
+                        'items': f'Error in item {index + 1}: {str(e)}'
+                    })
             instance.total_amount = total_amount
             instance.save()
         
         return instance
+
+
+        
 
 class ReceivingItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='po_item.item.name', read_only=True)

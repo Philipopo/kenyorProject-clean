@@ -159,6 +159,19 @@ class UserListView(generics.ListAPIView):
     serializer_class = UserListSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        # Only return active users who can be added to approval board
+        return User.objects.filter(is_active=True).order_by('name', 'email')
+    
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        serializer = self.get_serializer(queryset, many=True)
+        # Return in the format your frontend expects
+        return Response({
+            'results': serializer.data,
+            'count': queryset.count()
+        })
+
 class RegisterView(APIView):
     permission_classes = [AllowAny]
     def post(self, request):

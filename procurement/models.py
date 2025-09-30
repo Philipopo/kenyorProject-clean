@@ -41,6 +41,19 @@ class Vendor(models.Model):
         if self.lead_time <= 0:
             raise ValidationError("Lead time must be positive.")
 
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'contact_person': self.contact_person,
+            'email': self.email,
+            'phone': self.phone,
+            'status': self.status,
+            'ratings': self.ratings,
+            'lead_time': self.lead_time
+        }
+
+
+
 class ApprovalBoard(models.Model):
     """Manages users who can approve requisitions and purchase orders"""
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='approval_board_memberships')
@@ -110,6 +123,7 @@ class Requisition(models.Model):
         except ApprovalBoard.DoesNotExist:
             return False
 
+    
 
 class RequisitionItem(models.Model):
     requisition = models.ForeignKey(Requisition, on_delete=models.CASCADE, related_name='items')
@@ -130,6 +144,22 @@ class RequisitionItem(models.Model):
         if self.unit_cost and self.quantity:
             self.total_cost = self.unit_cost * self.quantity
         super().save(*args, **kwargs)
+
+    def to_dict(self):
+        return {
+            'code': self.code,
+            'department': self.department,
+            'purpose': self.purpose,
+            'status': self.status,
+            'priority': self.priority,
+            'requested_by': self.requested_by.email if self.requested_by else None,
+            'approved_by': self.approved_by.email if self.approved_by else None,
+            'total_items': self.items.count(),
+            'total_cost': sum(item.total_cost or 0 for item in self.items.all())
+        }
+
+
+
 
 class PurchaseOrder(models.Model):
     STATUS_CHOICES = [
@@ -190,6 +220,20 @@ class PurchaseOrder(models.Model):
         if not self.items.exists():
             return False
         return all(item.received_quantity >= item.quantity for item in self.items.all())
+
+    def to_dict(self):
+        return {
+            'code': self.code,
+            'vendor': self.vendor.name if self.vendor else None,
+            'department': self.department,
+            'status': self.status,
+            'total_amount': float(self.total_amount),
+            'expected_delivery_date': self.expected_delivery_date.isoformat() if self.expected_delivery_date else None,
+            'total_items': self.items.count()
+        }
+
+
+
 
 class POItem(models.Model):
     po = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name='items')
@@ -259,6 +303,22 @@ class Receiving(models.Model):
         elif any(r.status == 'complete' for r in po.receivings.all()):
             po.status = 'partially_received'
         po.save()
+
+
+
+
+    def to_dict(self):
+        return {
+            'grn': self.grn,
+            'po_code': self.po.code if self.po else None,
+            'invoice_number': self.invoice_number,
+            'status': self.status,
+            'total_items': self.items.count(),
+            'total_received': sum(item.received_quantity for item in self.items.all())
+        }
+
+
+
 
 class ReceivingItem(models.Model):
     receiving = models.ForeignKey(Receiving, on_delete=models.CASCADE, related_name='items')
@@ -342,3 +402,27 @@ class ProcurementAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.user.email} {self.action} {self.model_name} {self.object_id}"
+
+
+
+class ProcurementAuditLog(models.Model):
+    ACTION_CHOICES = [
+        ('create', 'Create'),
+        ('update', 'Update'),
+        ('delete', 'Delete'),
+        ('approve', 'Approve'),
+        ('reject', 'Reject'),
+        ('receive', 'Receive'),
+        ('submit', 'Submit'),
+        ('cancel', 'Cancel'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    model_name = models.CharField(max_length=50)
+    object_id = models.PositiveIntegerField()
+    details = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']

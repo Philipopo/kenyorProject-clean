@@ -3,6 +3,10 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 import logging
 from django.utils import timezone
+from django.contrib.auth import get_user_model
+from django.db.models import Sum
+
+User = get_user_model()
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,8 @@ class Item(models.Model):
             logger.warning(f"Item {self.name} critical low stock alert triggered.")
         
         # Expiry alert (if item has expiry date)
+
+        
         if self.expiry_date:
             days_until_expiry = (self.expiry_date - timezone.now().date()).days
             if 0 <= days_until_expiry <= 7:  # Expiring within 7 days
@@ -85,7 +91,17 @@ class Item(models.Model):
                 )
                 logger.warning(f"Item {self.name} expired alert triggered.")
 
-
+    def total_quantity(self):
+        """Calculate total quantity across all stock records"""
+        # Fix: Use Sum aggregation properly
+        result = self.stock_records.aggregate(
+            total=Sum('quantity')
+        )
+        return result['total'] or 0
+    
+    def available_quantity(self):
+        """Calculate available quantity (total - reserved)"""
+        return max(0, self.total_quantity() - self.reserved_quantity)
 
 
 
@@ -322,3 +338,31 @@ class ExpiryTrackedItem(models.Model):
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
+
+
+
+class InventoryActivityLog(models.Model):
+    ACTION_CHOICES = [
+        ('create', 'Create'),
+        ('update', 'Update'),
+        ('delete', 'Delete'),
+        ('stock_in', 'Stock In'),
+        ('stock_out', 'Stock Out'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='inventory_activities')
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    model_name = models.CharField(max_length=50)  # 'Item', 'StorageBin', 'StockRecord', etc.
+    object_id = models.PositiveIntegerField()
+    object_name = models.CharField(max_length=255, blank=True)  # e.g., item name, bin ID
+    details = models.JSONField(default=dict, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-timestamp']
+        verbose_name = 'Inventory Activity Log'
+        verbose_name_plural = 'Inventory Activity Logs'
+    
+    def __str__(self):
+        user_name = self.user.name if self.user and self.user.name else (self.user.email if self.user else 'Unknown')
+        return f"{user_name} {self.action} {self.model_name} {self.object_name} at {self.timestamp}"

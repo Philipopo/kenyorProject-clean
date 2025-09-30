@@ -1,45 +1,68 @@
-from rest_framework import serializers
-from .models import ProductInflow, ProductOutflow, SerialNumber
-from inventory.models import Item
+# product_documentation/serializers.py
 
-class SerialNumberSerializer(serializers.ModelSerializer):
+from rest_framework import serializers
+from .models import ProductInflow, ProductOutflow, ProductSerialNumber  # ✅ Fixed name
+from inventory.models import Item
+from accounts.models import User
+
+
+
+class UserSerializer(serializers.ModelSerializer):
     class Meta:
-        model = SerialNumber
+        model = User
+        fields = ['id', 'name', 'email']
+
+class ProductSerialNumberSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductSerialNumber
         fields = ['id', 'serial_number', 'status']
 
 class ProductInflowSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
-    item_batch = serializers.CharField(source='item.batch', read_only=True)
-    serial_numbers = SerialNumberSerializer(many=True, read_only=True)
+    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
+    serial_numbers = ProductSerialNumberSerializer(many=True, read_only=True)
     input_serial_numbers = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     class Meta:
         model = ProductInflow
         fields = [
-            'id', 'item', 'item_name', 'item_batch', 'batch', 'vendor',
-            'date_of_delivery', 'quantity', 'cost', 'serial_numbers',
-            'created_at', 'updated_at', 'input_serial_numbers'
+            'id', 'item', 'item_name', 'batch', 'vendor',
+            'date_of_delivery', 'quantity', 'cost',
+             'created_by', 'serial_numbers',
+            'created_at', 'input_serial_numbers'
         ]
-        read_only_fields = ['id', 'item_name', 'item_batch', 'serial_numbers', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'item_name', 'created_by', 'serial_numbers', 'created_at']
+
+    def get_created_by(self, obj):
+        user = obj.user
+        if user:
+            try:
+                profile = user.profile
+                if profile and profile.full_name:
+                    return profile.full_name
+            except:
+                pass
+            return user.name or user.email
+        return '—'
+
 
     def validate_input_serial_numbers(self, value):
         quantity = self.initial_data.get('quantity')
         if value and quantity:
             serials = [s.strip() for s in value.split(',') if s.strip()]
             if len(serials) != int(quantity):
-                raise serializers.ValidationError(
-                    "Number of serial numbers must match quantity."
-                )
+                raise serializers.ValidationError("Number of serial numbers must match quantity.")
         return value
 
     def create(self, validated_data):
         serial_numbers = validated_data.pop('input_serial_numbers', '')
+        validated_data['created_by'] = self.context['request'].user
         inflow = ProductInflow.objects.create(**validated_data)
         if serial_numbers:
             serials = [s.strip() for s in serial_numbers.split(',') if s.strip()]
             for serial in serials:
-                SerialNumber.objects.create(
-                    product_inflow=inflow,
+                ProductSerialNumber.objects.create(
+                    inflow=inflow,
                     serial_number=serial,
                     status='in_stock'
                 )
@@ -47,13 +70,14 @@ class ProductInflowSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         serial_numbers = validated_data.pop('input_serial_numbers', None)
+        validated_data['created_by'] = self.context['request'].user
         instance = super().update(instance, validated_data)
         if serial_numbers is not None:
-            instance.new_serial_numbers.all().delete()
+            instance.serial_numbers.all().delete()
             serials = [s.strip() for s in serial_numbers.split(',') if s.strip()]
             for serial in serials:
-                SerialNumber.objects.create(
-                    product_inflow=instance,
+                ProductSerialNumber.objects.create(
+                    inflow=instance,
                     serial_number=serial,
                     status='in_stock'
                 )
@@ -61,73 +85,67 @@ class ProductInflowSerializer(serializers.ModelSerializer):
 
 class ProductOutflowSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='product.item.name', read_only=True)
-    item_batch = serializers.CharField(source='product.item.batch', read_only=True)
-    serial_numbers = SerialNumberSerializer(many=True, read_only=True)
+    responsible_staff_name = serializers.CharField(source='responsible_staff.name', read_only=True)
+    serial_numbers = ProductSerialNumberSerializer(many=True, read_only=True)
     input_serial_numbers = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     class Meta:
         model = ProductOutflow
         fields = [
-            'id', 'product', 'item_name', 'item_batch', 'customer_name', 'sales_order',
-            'dispatch_date', 'quantity', 'serial_numbers', 'created_at', 'updated_at',
-            'input_serial_numbers'
+            'id', 'product', 'item_name', 'customer_name', 'sales_order',
+            'dispatch_date', 'quantity', 'responsible_staff', 'responsible_staff_name',
+            'serial_numbers', 'created_at', 'input_serial_numbers'
         ]
-        read_only_fields = ['id', 'item_name', 'item_batch', 'serial_numbers', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'item_name', 'responsible_staff_name', 'serial_numbers', 'created_at']
 
     def validate_input_serial_numbers(self, value):
         quantity = self.initial_data.get('quantity')
         if value and quantity:
             serials = [s.strip() for s in value.split(',') if s.strip()]
             if len(serials) != int(quantity):
-                raise serializers.ValidationError(
-                    "Number of serial numbers must match quantity."
-                )
+                raise serializers.ValidationError("Number of serial numbers must match quantity.")
         return value
 
     def validate(self, data):
         product = data.get('product')
-        quantity = data.get('quantity')
-        serials = data.get('input_serial_numbers', '')
-        serials = [s.strip() for s in serials.split(',') if s.strip()] if serials else []
-        available_serials = product.new_serial_numbers.filter(status='in_stock').values_list('serial_number', flat=True)
+        serials_input = data.get('input_serial_numbers', '')
+        serials = [s.strip() for s in serials_input.split(',') if s.strip()] if serials_input else []
+        available_serials = product.serial_numbers.filter(status='in_stock').values_list('serial_number', flat=True)
         if serials and any(s not in available_serials for s in serials):
             raise serializers.ValidationError("Invalid or unavailable serial numbers selected.")
         return data
 
     def create(self, validated_data):
         serial_numbers = validated_data.pop('input_serial_numbers', '')
+        validated_data['responsible_staff'] = self.context['request'].user
         outflow = ProductOutflow.objects.create(**validated_data)
         if serial_numbers:
             serials = [s.strip() for s in serial_numbers.split(',') if s.strip()]
             for serial in serials:
-                serial_obj = SerialNumber.objects.get(
-                    product_inflow=outflow.product,
+                serial_obj = ProductSerialNumber.objects.get(
+                    inflow=outflow.product,
                     serial_number=serial,
                     status='in_stock'
                 )
-                serial_obj.status = 'shipped'
-                serial_obj.product_outflow = outflow
+                serial_obj.status = 'dispatched'
                 serial_obj.save()
+                outflow.serial_numbers.add(serial_obj)
         return outflow
 
     def update(self, instance, validated_data):
         serial_numbers = validated_data.pop('input_serial_numbers', None)
+        validated_data['responsible_staff'] = self.context['request'].user
         instance = super().update(instance, validated_data)
         if serial_numbers is not None:
-            instance.new_serial_numbers.all().update(status='in_stock', product_outflow=None)
+            instance.serial_numbers.clear()
             serials = [s.strip() for s in serial_numbers.split(',') if s.strip()]
             for serial in serials:
-                serial_obj = SerialNumber.objects.get(
-                    product_inflow=instance.product,
+                serial_obj = ProductSerialNumber.objects.get(
+                    inflow=instance.product,
                     serial_number=serial,
                     status='in_stock'
                 )
-                serial_obj.status = 'shipped'
-                serial_obj.product_outflow = instance
+                serial_obj.status = 'dispatched'
                 serial_obj.save()
+                instance.serial_numbers.add(serial_obj)
         return instance
-
-class ItemSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Item
-        fields = ['id', 'name', 'batch']

@@ -1,4 +1,3 @@
-# procurement/views.py
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -6,10 +5,10 @@ from rest_framework.permissions import IsAuthenticated
 from django.db.models import Q, Sum
 from django.http import HttpResponse
 from django.conf import settings
-import io
 from datetime import datetime
+from io import BytesIO
 
-# ReportLab imports for PDF generation (no Cairo needed)
+# ReportLab imports for PDF generation
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import (
@@ -17,7 +16,6 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from io import BytesIO
 
 from .models import (
     Requisition, RequisitionItem, PurchaseOrder, POItem, 
@@ -38,6 +36,36 @@ class StandardResultsSetPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+# TEMPORARILY COMMENTED OUT - Audit logging disabled for deadline
+# def log_procurement_action(user, action, model_name, object_id, details=None, instance=None):
+#     """
+#     Comprehensive audit logging function
+#     """
+#     from .models import ProcurementAuditLog
+#     
+#     log_details = details or {}
+#     
+#     # Add instance details if available
+#     if instance:
+#         if hasattr(instance, 'to_dict'):
+#             log_details['object_data'] = instance.to_dict()
+#         else:
+#             # Generic serialization
+#             try:
+#                 from django.forms.models import model_to_dict
+#                 log_details['object_data'] = model_to_dict(instance)
+#             except:
+#                 log_details['object_data'] = str(instance)
+#     
+#     # Create audit log
+#     ProcurementAuditLog.objects.create(
+#         user=user,
+#         action=action,
+#         model_name=model_name,
+#         object_id=object_id,
+#         details=log_details
+#     )
 
 class ApprovalBoardViewSet(viewsets.ModelViewSet):
     queryset = ApprovalBoard.objects.select_related('user', 'added_by')
@@ -63,10 +91,41 @@ class ApprovalBoardViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(added_by=self.request.user)
+        instance = serializer.save(added_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='ApprovalBoard',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'operation': 'Added approval board member'}
+        # )
 
     def perform_update(self, serializer):
-        serializer.save(added_by=self.request.user)
+        instance = serializer.save(added_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='update',
+        #     model_name='ApprovalBoard',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'operation': 'Updated approval board member'}
+        # )
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else str(instance)
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='ApprovalBoard',
+        #     object_id=instance_id,
+        #     details={'operation': 'Deleted approval board member', 'deleted_data': instance_data}
+        # )
 
 class VendorViewSet(viewsets.ModelViewSet):
     queryset = Vendor.objects.all()
@@ -89,10 +148,42 @@ class VendorViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        instance = serializer.save(created_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='Vendor',
+        #     object_id=instance.id,
+        #     instance=instance
+        # )
 
     def perform_update(self, serializer):
-        serializer.save(created_by=self.request.user)
+        instance = serializer.save(created_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='update',
+        #     model_name='Vendor',
+        #     object_id=instance.id,
+        #     instance=instance
+        # )
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'name': instance.name,
+            'email': instance.email
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='Vendor',
+        #     object_id=instance_id,
+        #     details={'deleted_vendor': instance_data}
+        # )
 
 class RequisitionViewSet(viewsets.ModelViewSet):
     queryset = Requisition.objects.all()
@@ -122,56 +213,148 @@ class RequisitionViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def approval_board(self, request):
-        """Get list of users who can approve requisitions"""
+        """Get comprehensive approval board information for frontend workflow"""
+        user = request.user
+        
+        # Get user's approval capabilities
+        try:
+            user_approval = ApprovalBoard.objects.get(user=user, is_active=True)
+            can_approve_requisitions = user_approval.can_approve_requisitions
+            can_approve_pos = user_approval.can_approve_purchase_orders
+        except ApprovalBoard.DoesNotExist:
+            can_approve_requisitions = False
+            can_approve_pos = False
+        
+        # Get all active approval board members
         approval_board = ApprovalBoard.objects.filter(
-            can_approve_requisitions=True,
             is_active=True
         ).select_related('user')
         
-        # Serialize the data
-        data = []
+        # Count pending items for the current user
+        pending_requisitions = 0
+        pending_pos = 0
+        
+        if can_approve_requisitions:
+            pending_requisitions = Requisition.objects.filter(
+                status='submitted'
+            ).count()
+        
+        if can_approve_pos:
+            pending_pos = PurchaseOrder.objects.filter(
+                status='submitted'
+            ).count()
+        
+        # Serialize approval board members
+        board_members = []
         for member in approval_board:
-            data.append({
+            board_members.append({
                 'id': member.id,
                 'user_id': member.user.id,
                 'user_email': member.user.email,
                 'user_name': member.user.name,
                 'can_approve_requisitions': member.can_approve_requisitions,
                 'can_approve_purchase_orders': member.can_approve_purchase_orders,
-                'is_active': member.is_active
+                'is_active': member.is_active,
+                'date_added': member.added_at.isoformat() if member.added_at else None
             })
         
-        return Response(data)
+        return Response({
+            'current_user': {
+                'can_approve_requisitions': can_approve_requisitions,
+                'can_approve_purchase_orders': can_approve_pos,
+                'pending_requisitions': pending_requisitions,
+                'pending_purchase_orders': pending_pos
+            },
+            'approval_board_members': board_members,
+            'total_approvers': len(board_members)
+        })
 
     def perform_create(self, serializer):
-        serializer.save(
+        instance = serializer.save(
             created_by=self.request.user,
             requested_by=self.request.user
         )
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='Requisition',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'status': 'draft'}
+        # )
 
     def perform_update(self, serializer):
-        serializer.save(created_by=self.request.user)
+        old_status = self.get_object().status
+        instance = serializer.save(created_by=self.request.user)
+        new_status = instance.status
+        
+        # Log status changes specifically
+        if old_status != new_status:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Requisition',
+            #     object_id=instance.id,
+            #     instance=instance,
+            #     details={'status_change': f'{old_status} -> {new_status}'}
+            # )
+            pass
+        else:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Requisition',
+            #     object_id=instance.id,
+            #     instance=instance
+            # )
+            pass
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'code': instance.code,
+            'department': instance.department
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='Requisition',
+        #     object_id=instance_id,
+        #     details={'deleted_requisition': instance_data}
+        # )
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         requisition = self.get_object()
         if not requisition.can_approve(request.user):
             return Response({'error': 'You do not have permission to approve this requisition.'}, 
-                          status=status.HTTP_403_FORBIDDEN)
+                        status=status.HTTP_403_FORBIDDEN)
         
         requisition.status = 'approved'
         requisition.approved_by = request.user
         requisition.approved_at = datetime.now()
         requisition.save()
         
-        # Create audit log
-        ProcurementAuditLog.objects.create(
-            user=request.user,
-            action='approve',
-            model_name='Requisition',
-            object_id=requisition.id,
-            details={'status': 'approved'}
-        )
+        # TEMPORARILY COMMENTED OUT - Manual audit log creation disabled
+        # Convert datetime to string for JSON serialization
+        # approved_at_str = requisition.approved_at.isoformat() if requisition.approved_at else None
+        # 
+        # ProcurementAuditLog.objects.create(
+        #     user=request.user,
+        #     action='approve',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     details={
+        #         'status': 'approved',
+        #         'approved_at': approved_at_str,
+        #         'requisition_code': requisition.code
+        #     }
+        # )
         
         return Response({'status': 'approved'})
 
@@ -182,18 +365,69 @@ class RequisitionViewSet(viewsets.ModelViewSet):
             return Response({'error': 'You do not have permission to reject this requisition.'}, 
                           status=status.HTTP_403_FORBIDDEN)
         
+        old_status = requisition.status
         requisition.status = 'rejected'
         requisition.save()
         
-        ProcurementAuditLog.objects.create(
-            user=request.user,
-            action='reject',
-            model_name='Requisition',
-            object_id=requisition.id,
-            details={'status': 'rejected'}
-        )
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='reject',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     instance=requisition,
+        #     details={'status_change': f'{old_status} -> rejected'}
+        # )
         
         return Response({'status': 'rejected'})
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Submit requisition for approval"""
+        requisition = self.get_object()
+        if requisition.status != 'draft':
+            return Response({'error': 'Only draft requisitions can be submitted.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = requisition.status
+        requisition.status = 'submitted'
+        requisition.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='submit',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     instance=requisition,
+        #     details={'status_change': f'{old_status} -> submitted'}
+        # )
+        
+        return Response({'status': 'submitted'})
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel requisition"""
+        requisition = self.get_object()
+        if requisition.status in ['approved', 'completed']:
+            return Response({'error': 'Cannot cancel approved or completed requisitions.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = requisition.status
+        requisition.status = 'cancelled'
+        requisition.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='cancel',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     instance=requisition,
+        #     details={'status_change': f'{old_status} -> cancelled'}
+        # )
+        
+        return Response({'status': 'cancelled'})
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
     queryset = PurchaseOrder.objects.all()
@@ -222,10 +456,59 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        instance = serializer.save(created_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='PurchaseOrder',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'status': 'draft'}
+        # )
 
     def perform_update(self, serializer):
-        serializer.save(created_by=self.request.user)
+        old_status = self.get_object().status
+        instance = serializer.save(created_by=self.request.user)
+        new_status = instance.status
+        
+        if old_status != new_status:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='PurchaseOrder',
+            #     object_id=instance.id,
+            #     instance=instance,
+            #     details={'status_change': f'{old_status} -> {new_status}'}
+            # )
+            pass
+        else:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='PurchaseOrder',
+            #     object_id=instance.id,
+            #     instance=instance
+            # )
+            pass
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'code': instance.code,
+            'vendor': instance.vendor.name if instance.vendor else None
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='PurchaseOrder',
+        #     object_id=instance_id,
+        #     details={'deleted_po': instance_data}
+        # )
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
@@ -234,18 +517,21 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             return Response({'error': 'You do not have permission to approve this purchase order.'}, 
                           status=status.HTTP_403_FORBIDDEN)
         
+        old_status = po.status
         po.status = 'approved'
         po.approved_by = request.user
         po.approved_at = datetime.now()
         po.save()
         
-        ProcurementAuditLog.objects.create(
-            user=request.user,
-            action='approve',
-            model_name='PurchaseOrder',
-            object_id=po.id,
-            details={'status': 'approved'}
-        )
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='approve',
+        #     model_name='PurchaseOrder',
+        #     object_id=po.id,
+        #     instance=po,
+        #     details={'status_change': f'{old_status} -> approved'}
+        # )
         
         return Response({'status': 'approved'})
 
@@ -329,7 +615,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             total = item.quantity * item.unit_price
             item_data.append([
                 item.item.name if item.item else "N/A",
-                item.description or "",
+                getattr(item, 'description', "") or "",
                 str(item.quantity),
                 f"{item.unit_price:.2f}",
                 f"{total:.2f}"
@@ -374,6 +660,54 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         response['Content-Disposition'] = f'attachment; filename="PO_{po.code}.pdf"'
         return response
 
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Submit PO for approval"""
+        po = self.get_object()
+        if po.status != 'draft':
+            return Response({'error': 'Only draft POs can be submitted.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = po.status
+        po.status = 'submitted'
+        po.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='submit',
+        #     model_name='PurchaseOrder',
+        #     object_id=po.id,
+        #     instance=po,
+        #     details={'status_change': f'{old_status} -> submitted'}
+        # )
+        
+        return Response({'status': 'submitted'})
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel PO"""
+        po = self.get_object()
+        if po.status in ['approved', 'received']:
+            return Response({'error': 'Cannot cancel approved or received POs.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = po.status
+        po.status = 'cancelled'
+        po.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='cancel',
+        #     model_name='PurchaseOrder',
+        #     object_id=po.id,
+        #     instance=po,
+        #     details={'status_change': f'{old_status} -> cancelled'}
+        # )
+        
+        return Response({'status': 'cancelled'})
+
 class ReceivingViewSet(viewsets.ModelViewSet):
     queryset = Receiving.objects.all()
     serializer_class = ReceivingSerializer
@@ -401,13 +735,63 @@ class ReceivingViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(
+        instance = serializer.save(
             created_by=self.request.user,
             received_by=self.request.user
         )
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='Receiving',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'status': instance.status}
+        # )
+        # Update PO status is already handled in model
 
     def perform_update(self, serializer):
-        serializer.save(created_by=self.request.user)
+        old_status = self.get_object().status
+        instance = serializer.save(created_by=self.request.user)
+        new_status = instance.status
+        
+        if old_status != new_status:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Receiving',
+            #     object_id=instance.id,
+            #     instance=instance,
+            #     details={'status_change': f'{old_status} -> {new_status}'}
+            # )
+            pass
+        else:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Receiving',
+            #     object_id=instance.id,
+            #     instance=instance
+            # )
+            pass
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'grn': instance.grn,
+            'po_code': instance.po.code if instance.po else None
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='Receiving',
+        #     object_id=instance_id,
+        #     details={'deleted_receiving': instance_data}
+        # )
 
 class ProcurementAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ProcurementAuditLog.objects.all()
@@ -418,4 +802,16 @@ class ProcurementAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         queryset = ProcurementAuditLog.objects.select_related('user')
-        return queryset
+        # Add filtering capabilities
+        model_name = self.request.query_params.get('model_name', None)
+        action = self.request.query_params.get('action', None)
+        user_id = self.request.query_params.get('user_id', None)
+        
+        if model_name:
+            queryset = queryset.filter(model_name__icontains=model_name)
+        if action:
+            queryset = queryset.filter(action=action)
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+            
+        return queryset.order_by('-created_at')

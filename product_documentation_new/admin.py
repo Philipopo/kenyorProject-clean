@@ -3,7 +3,7 @@ from .models import ProductInflow, ProductOutflow, SerialNumber
 
 @admin.register(ProductInflow)
 class ProductInflowAdmin(admin.ModelAdmin):
-    list_display = ('item_name', 'batch', 'vendor', 'date_of_delivery', 'quantity', 'cost', 'created_at', 'updated_at')
+    list_display = ('item_name', 'batch', 'vendor', 'date_of_delivery', 'quantity', 'cost', 'created_at')
     list_filter = ('vendor', 'date_of_delivery', 'created_at')
     search_fields = ('item__name', 'batch', 'vendor')
     date_hierarchy = 'date_of_delivery'
