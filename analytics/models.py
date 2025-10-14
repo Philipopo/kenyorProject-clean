@@ -32,12 +32,34 @@ class EOQReportV2(models.Model):
     eoq = models.PositiveIntegerField(blank=True, help_text="Calculated Economic Order Quantity")
     reorder_point = models.PositiveIntegerField(blank=True, help_text="Inventory level to trigger reorder")
     total_cost = models.DecimalField(max_digits=12, decimal_places=2, blank=True, help_text="Total inventory cost at EOQ")
+    holding_cost_breakdown = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True, help_text="Holding cost component")
+    ordering_cost_breakdown = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True, help_text="Ordering cost component")
+    inventory_turnover = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True, help_text="Inventory turnover ratio")
+    supplier = models.ForeignKey('Supplier', on_delete=models.SET_NULL, null=True, blank=True, help_text="Supplier for this item")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "EOQ Report V2"
         verbose_name_plural = "EOQ Reports V2"
+
+    def calculate_safety_stock(self):
+        from inventory.models import StockMovement
+        try:
+            # Get last 6 months of stock movements for the item
+            movements = StockMovement.objects.filter(
+                item=self.item,
+                timestamp__gte=self.created_at - timezone.timedelta(days=180)
+            ).values('quantity')
+            quantities = [m['quantity'] for m in movements]
+            if not quantities:
+                return 0
+            max_daily_demand = max(quantities) / 30  # Assume monthly avg
+            avg_daily_demand = sum(quantities) / len(quantities) / 30
+            max_lead_time = self.lead_time_days * 1.2  # 20% buffer
+            return round((max_daily_demand * max_lead_time) - (avg_daily_demand * self.lead_time_days))
+        except:
+            return 0
 
     def clean(self):
         if self.demand_rate <= 0:
@@ -63,7 +85,16 @@ class EOQReportV2(models.Model):
         # Calculate Total Cost: sqrt(2 * D * S * H)
         self.total_cost = round(math.sqrt(2 * self.demand_rate * float(self.order_cost) * float(self.holding_cost)), 2)
 
+        # Calculate Cost Breakdowns
+        orders_per_year = self.demand_rate / self.eoq if self.eoq else 0
+        self.holding_cost_breakdown = round((self.eoq / 2) * float(self.holding_cost), 2)
+        self.ordering_cost_breakdown = round(orders_per_year * float(self.order_cost), 2)
+
+        # Calculate Inventory Turnover
+        self.inventory_turnover = round(self.demand_rate / (self.eoq / 2), 2) if self.eoq else 0
+
     def save(self, *args, **kwargs):
+        self.safety_stock = self.calculate_safety_stock()
         self.clean()
         super().save(*args, **kwargs)
 
@@ -80,3 +111,33 @@ class StockAnalytics(models.Model):
 
     def __str__(self):
         return f"{self.item} - {self.category}"
+
+class ReorderQueue(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reorder_queues')
+    item = models.ForeignKey('inventory.Item', on_delete=models.CASCADE, related_name='reorder_queues')
+    recommended_quantity = models.PositiveIntegerField(help_text="Quantity to reorder based on EOQ")
+    status = models.CharField(max_length=20, choices=[
+        ('Pending', 'Pending'),
+        ('Ordered', 'Ordered'),
+        ('Completed', 'Completed')
+    ], default='Pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Reorder Queue"
+        verbose_name_plural = "Reorder Queues"
+
+    def __str__(self):
+        return f"Reorder {self.recommended_quantity} of {self.item.name}"
+
+class Supplier(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    lead_time_days = models.PositiveIntegerField(default=7, help_text="Default lead time in days")
+    min_order_quantity = models.PositiveIntegerField(blank=True, null=True, help_text="Minimum order quantity")
+    discount_threshold = models.PositiveIntegerField(blank=True, null=True, help_text="Quantity for discount")
+    discount_percentage = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True, help_text="Discount percentage")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name

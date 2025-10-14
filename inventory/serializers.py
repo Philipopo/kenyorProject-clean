@@ -12,12 +12,14 @@ class WarehouseSerializer(serializers.ModelSerializer):
     usage_percentage = serializers.ReadOnlyField()
     created_by = serializers.SerializerMethodField()
     bin_locations = serializers.SerializerMethodField()
+    state = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    country = serializers.CharField(max_length=100, required=False, allow_blank=True)
 
     class Meta:
         model = Warehouse
         fields = [
-            'id', 'name', 'code', 'description', 'address', 'capacity',
-            'is_active', 'total_bins', 'used_capacity', 'available_capacity',
+            'id', 'name', 'code', 'description', 'address', 'city', 'state', 'country',
+            'capacity', 'is_active', 'total_bins', 'used_capacity', 'available_capacity',
             'usage_percentage', 'user', 'created_by', 'created_at', 'updated_at', 'bin_locations'
         ]
         read_only_fields = ['user', 'created_at', 'updated_at']
@@ -28,7 +30,6 @@ class WarehouseSerializer(serializers.ModelSerializer):
         return '—'
 
     def get_bin_locations(self, obj):
-        """Get organized bin locations for warehouse layout display"""
         bins = obj.bins.select_related('warehouse').all().order_by('row', 'rack', 'shelf')
         locations = {}
         for bin in bins:
@@ -49,6 +50,7 @@ class WarehouseSerializer(serializers.ModelSerializer):
         return locations
 
 class ItemSerializer(serializers.ModelSerializer):
+    material_id = serializers.CharField(read_only=True)
     total_quantity = serializers.SerializerMethodField()
     available_quantity = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
@@ -56,11 +58,11 @@ class ItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = Item
         fields = [
-            'id', 'name', 'part_number', 'manufacturer', 'contact', 'batch', 'expiry_date',
+            'id', 'material_id', 'name', 'description', 'part_number', 'manufacturer', 'contact', 'batch', 'expiry_date',
             'min_stock_level', 'reserved_quantity', 'custom_fields', 'user', 'created_at',
             'total_quantity', 'available_quantity', 'created_by'
         ]
-        read_only_fields = ['id', 'user', 'created_at', 'total_quantity', 'available_quantity', 'created_by']
+        read_only_fields = ['id', 'material_id', 'user', 'created_at', 'total_quantity', 'available_quantity', 'created_by']
 
     def get_total_quantity(self, obj):
         return obj.total_quantity()
@@ -113,19 +115,16 @@ class ItemSerializer(serializers.ModelSerializer):
         
         return data
 
-
-        
 class StockRecordSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
+    material_id = serializers.CharField(source='item.material_id', read_only=True)
     storage_bin_id = serializers.CharField(source='storage_bin.bin_id', read_only=True)
-    item = ItemSerializer(read_only=True)  # This includes all item fields
+    item = ItemSerializer(read_only=True)
 
     class Meta:
         model = StockRecord
-        fields = ['id', 'item', 'item_name', 'storage_bin', 'storage_bin_id', 'quantity', 'user', 'created_at']
-        read_only_fields = ['user', 'item_name', 'storage_bin_id', 'created_at']
-
-
+        fields = ['id', 'item', 'item_name', 'material_id', 'storage_bin', 'storage_bin_id', 'quantity', 'user', 'created_at']
+        read_only_fields = ['user', 'item_name', 'material_id', 'storage_bin_id', 'created_at']
 
 class StorageBinSerializer(serializers.ModelSerializer):
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
@@ -133,7 +132,6 @@ class StorageBinSerializer(serializers.ModelSerializer):
     usage_percentage = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
     location_display = serializers.SerializerMethodField()
-    # Remove the redundant source parameter and include full stock records
     stock_records = StockRecordSerializer(many=True, read_only=True)
 
     class Meta:
@@ -145,8 +143,6 @@ class StorageBinSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'stock_records'
         ]
         read_only_fields = ['user', 'current_load', 'created_at', 'updated_at']
-
-        
 
     def get_usage_percentage(self, obj):
         if obj.capacity == 0:
@@ -165,7 +161,6 @@ class StorageBinSerializer(serializers.ModelSerializer):
         return location
 
     def validate(self, data):
-        # Validate that bin_id is unique
         if 'bin_id' in data:
             queryset = StorageBin.objects.filter(bin_id=data['bin_id'])
             if self.instance:
@@ -173,7 +168,6 @@ class StorageBinSerializer(serializers.ModelSerializer):
             if queryset.exists():
                 raise serializers.ValidationError({"bin_id": "Bin ID must be unique."})
         
-        # Prevent assigning bin to multiple warehouses
         if 'warehouse' in data and data['warehouse']:
             bin_id = data.get('bin_id')
             if bin_id:
@@ -187,7 +181,6 @@ class StorageBinSerializer(serializers.ModelSerializer):
                         "warehouse": f"Bin {bin_id} already belongs to warehouse '{existing_bin.warehouse.name}'. Remove it first."
                     })
         
-        # Validate warehouse-row-rack-shelf uniqueness
         warehouse = data.get('warehouse', getattr(self.instance, 'warehouse', None))
         row = data.get('row', getattr(self.instance, 'row', None))
         rack = data.get('rack', getattr(self.instance, 'rack', None))
@@ -206,20 +199,20 @@ class StorageBinSerializer(serializers.ModelSerializer):
         
         return data
 
-
-
-
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
     storage_bin_id = serializers.CharField(source='storage_bin.bin_id', read_only=True)
     batch = serializers.CharField(source='item.batch', read_only=True)
     user_display = serializers.SerializerMethodField()
+    # Add this line:
+    warehouse_receipt = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = StockMovement
         fields = [
-            'id', 'item', 'item_name', 'storage_bin', 'storage_bin_id', 'movement_type',
-            'quantity', 'user', 'user_display', 'timestamp', 'notes', 'batch'
+            'id', 'item', 'item_name', 'storage_bin', 'storage_bin_id', 
+            'movement_type', 'quantity', 'user', 'user_display', 
+            'timestamp', 'notes', 'batch', 'warehouse_receipt'  # ← include this
         ]
         read_only_fields = ['user', 'item_name', 'storage_bin_id', 'timestamp', 'batch', 'user_display']
 
@@ -232,20 +225,22 @@ class StockMovementSerializer(serializers.ModelSerializer):
 
 class InventoryAlertSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='related_item.name', read_only=True, allow_null=True)
+    material_id = serializers.CharField(source='related_item.material_id', read_only=True, allow_null=True)
     bin_id = serializers.CharField(source='related_bin.bin_id', read_only=True, allow_null=True)
 
     class Meta:
         model = InventoryAlert
-        fields = ['id', 'alert_type', 'message', 'related_item', 'item_name', 'related_bin', 'bin_id', 'created_at', 'is_resolved']
-        read_only_fields = ['created_at', 'item_name', 'bin_id']
+        fields = ['id', 'alert_type', 'message', 'related_item', 'item_name', 'material_id', 'related_bin', 'bin_id', 'created_at', 'is_resolved']
+        read_only_fields = ['created_at', 'item_name', 'material_id', 'bin_id']
 
 class ExpiryTrackedItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
+    material_id = serializers.CharField(source='item.material_id', read_only=True)
 
     class Meta:
         model = ExpiryTrackedItem
-        fields = ['id', 'item', 'item_name', 'batch', 'quantity', 'expiry_date', 'user', 'created_at']
-        read_only_fields = ['user', 'created_at', 'item_name']
+        fields = ['id', 'item', 'item_name', 'material_id', 'batch', 'quantity', 'expiry_date', 'user', 'created_at']
+        read_only_fields = ['user', 'created_at', 'item_name', 'material_id']
 
 class StockInSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
@@ -306,7 +301,7 @@ class StockInSerializer(serializers.Serializer):
                 notes=notes
             )
 
-            logger.info(f"Stock In: {quantity} of {item.name} to {storage_bin.bin_id} by {self.context['request'].user.email}")
+            logger.info(f"Stock In: {quantity} of {item.name} ({item.material_id}) to {storage_bin.bin_id} by {self.context['request'].user.email}")
 
 class StockOutSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
@@ -329,7 +324,7 @@ class StockOutSerializer(serializers.Serializer):
             InventoryAlert.objects.create(
                 user=self.context['request'].user,
                 alert_type='CRITICAL',
-                message=f"Cannot remove {data['quantity']} of {item.name} from bin {storage_bin.bin_id}: insufficient stock (available: {available}).",
+                message=f"Cannot remove {data['quantity']} of {item.name} ({item.material_id}) from bin {storage_bin.bin_id}: insufficient stock (available: {available}).",
                 related_bin=storage_bin,
                 related_item=item
             )
@@ -342,7 +337,7 @@ class StockOutSerializer(serializers.Serializer):
             InventoryAlert.objects.create(
                 user=self.context['request'].user,
                 alert_type='WARNING',
-                message=f"Requested quantity {data['quantity']} exceeds available stock ({available}) for {item.name} due to reservations.",
+                message=f"Requested quantity {data['quantity']} exceeds available stock ({available}) for {item.name} ({item.material_id}) due to reservations.",
                 related_item=item
             )
             raise serializers.ValidationError(
@@ -380,7 +375,7 @@ class StockOutSerializer(serializers.Serializer):
                 notes=notes
             )
 
-            logger.info(f"Stock Out: {quantity} of {item.name} from {storage_bin.bin_id} by {self.context['request'].user.email}")
+            logger.info(f"Stock Out: {quantity} of {item.name} ({item.material_id}) from {storage_bin.bin_id} by {self.context['request'].user.email}")
 
 class InventoryActivityLogSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source='user.name', read_only=True)

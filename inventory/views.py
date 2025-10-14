@@ -2,6 +2,8 @@ import csv
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.decorators import permission_classes
+from rest_framework.decorators import api_view  # ← ADD THIS LINE
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from django.db.models import Q, Sum, Count
@@ -9,7 +11,7 @@ from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 from django.db import transaction
 import logging
-from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem, InventoryActivityLog
+from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem, InventoryActivityLog, WarehouseReceipt
 from .serializers import (
     WarehouseSerializer, StorageBinSerializer, ItemSerializer, StockRecordSerializer, 
     StockMovementSerializer, InventoryAlertSerializer, ExpiryTrackedItemSerializer, 
@@ -21,6 +23,9 @@ from accounts.models import PagePermission, ActionPermission
 from django.http import JsonResponse
 from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser
+from django.shortcuts import render, get_object_or_404
+from django.contrib.auth.decorators import login_required
+
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +151,18 @@ class ItemViewSet(viewsets.ModelViewSet):
             details={'deleted_item': item_name}
         )
 
+
+    def get_queryset(self):
+        check_permission(self.request.user, page="items")
+        queryset = Item.objects.all().order_by('-id')
+        search = self.request.query_params.get('search', '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) |
+                Q(part_number__icontains=search) |
+                Q(material_id__icontains=search)  # ← Add this
+            )
+        return queryset
     
 
 
@@ -193,6 +210,7 @@ class ImportCSVView(APIView):
                         # Create item
                         item_data = {
                             'name': row['name'].strip(),
+                            'description': row.get('description', '').strip(),
                             'part_number': row['part_number'].strip(),
                             'manufacturer': row['manufacturer'].strip(),
                             'contact': row['contact'].strip(),
@@ -550,8 +568,44 @@ class StockOutView(APIView):
         check_permission(request.user, action="stock_out")
         serializer = StockOutSerializer(data=request.data, context={'request': request})
         if serializer.is_valid():
-            serializer.save()
-            return Response({"message": "Stock removed successfully"}, status=201)
+            # Save the stock movement
+            movement = serializer.save()
+
+            # Auto-create a warehouse receipt for Stock Out
+            try:
+                receipt = WarehouseReceipt.objects.create(
+                    issued_from_warehouse=movement.storage_bin.warehouse,
+                    issued_from_bin=movement.storage_bin,
+                    item=movement.item,
+                    quantity=movement.quantity,
+                    recipient="N/A",  # Will be updated later via receipt edit
+                    purpose=request.data.get('notes', ''),
+                    created_by=request.user,
+                    stock_movement=movement,
+                    # Auto-filled fields
+                    delivery_to="",
+                    transfer_order_no="",
+                    plant_site=movement.storage_bin.warehouse.code,
+                    bin_location=movement.storage_bin.bin_id,
+                    qty_picked=movement.quantity,
+                    qty_remaining=movement.item.available_quantity(),
+                    unloading_point="",
+                    original_document="",
+                    old_material_no="",
+                    picker="",
+                    controller=""
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create warehouse receipt: {e}")
+                receipt = None
+
+            response_data = {"message": "Stock removed successfully"}
+            if receipt:
+                response_data["receipt_id"] = receipt.id
+                response_data["receipt_number"] = receipt.receipt_number
+
+            return Response(response_data, status=201)
+
         logger.error(f"Stock Out failed: {serializer.errors}")
         return Response(serializer.errors, status=400)
 
@@ -804,3 +858,26 @@ class InventoryActivityLogViewSet(viewsets.ReadOnlyModelViewSet):
         check_permission(self.request.user, page="inventory_activity_logs")
         queryset = InventoryActivityLog.objects.select_related('user').order_by('-timestamp')
         return queryset
+
+
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def get_unique_states(request):
+    states = Warehouse.objects.exclude(state='').values_list('state', flat=True).distinct().order_by('state')
+    return Response(list(states))
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def get_unique_countries(request):
+    """Return list of unique non-empty countries from warehouses."""
+    countries = Warehouse.objects.exclude(country='').values_list('country', flat=True).distinct().order_by('country')
+    return Response(list(countries))
+
+
+
+@login_required
+def warehouse_receipt_print(request, receipt_id):
+    receipt = get_object_or_404(WarehouseReceipt, id=receipt_id)
+    return render(request, 'inventory/receipt_print.html', {'receipt': receipt})

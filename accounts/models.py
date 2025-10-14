@@ -215,7 +215,8 @@ PRODUCT_DOCUMENTATION_NEW_ACTIONS = [
 RENTALS_ACTIONS = [
     "create_rental", "update_rental", "delete_rental",
     "create_equipment", "update_equipment", "delete_equipment",
-    "create_payment", "update_payment", "delete_payment"
+    "create_payment", "update_payment", "delete_payment", "mark_rental_returned",
+    "view_overdue_rentals"
 ]
 
 

@@ -4,7 +4,8 @@ from .views import (
     WarehouseViewSet, WarehouseAnalyticsView,
     StorageBinViewSet, ItemViewSet, StockRecordViewSet,
     StockMovementViewSet, InventoryAlertViewSet, ExpiryTrackedItemViewSet,
-    StockInView, StockOutView, InventoryMetricsView, AnalyticsView, InventoryActivityLogViewSet, ImportCSVView
+    StockInView, StockOutView, InventoryMetricsView, AnalyticsView, InventoryActivityLogViewSet, ImportCSVView, get_unique_states,
+    get_unique_countries, warehouse_receipt_print
 )
 
 router = DefaultRouter()
@@ -26,4 +27,7 @@ urlpatterns = [
     path('analytics/', AnalyticsView.as_view(), name='inventory-analytics'),
     path('warehouse-analytics/', WarehouseAnalyticsView.as_view(), name='warehouse-analytics'),
     path('warehouse-analytics/<int:warehouse_id>/', WarehouseAnalyticsView.as_view(), name='warehouse-analytics-detail'),
+    path('warehouse-states/', get_unique_states, name='warehouse-states'),
+    path('warehouse-countries/', get_unique_countries, name='warehouse-countries'),
+    path('receipts/<int:receipt_id>/print/', warehouse_receipt_print, name='receipt-print'),
 ]
