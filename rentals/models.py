@@ -109,7 +109,7 @@ class Equipment(models.Model):
 
 class Reservation(models.Model):
     equipment = models.ForeignKey(Equipment, on_delete=models.CASCADE, related_name='reservations')
-    reserved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reservations')
+    reserved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reservations', null=True, blank=True)
     start_date = models.DateField()
     end_date = models.DateField(null=True, blank=True)  # null = open-ended
     quantity = models.PositiveIntegerField(default=1)
