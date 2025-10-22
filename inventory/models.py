@@ -6,6 +6,7 @@ from django.utils import timezone
 from django.contrib.auth import get_user_model
 from django.db.models import Sum
 import random
+import uuid
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -289,6 +290,13 @@ class StockMovement(models.Model):
     quantity = models.PositiveIntegerField()
     timestamp = models.DateTimeField(auto_now_add=True)
     notes = models.TextField(blank=True)
+    warehouse_receipt = models.ForeignKey(
+        'WarehouseReceipt',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='movements'
+    )
 
     def __str__(self):
         return f"{self.movement_type} {self.quantity} of {self.item.name} ({self.item.material_id}) in {self.storage_bin.bin_id}"
@@ -380,6 +388,7 @@ class WarehouseReceipt(models.Model):
     created_by = models.ForeignKey('accounts.User', on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     stock_movement = models.ForeignKey(StockMovement, on_delete=models.CASCADE, null=True, blank=True)
+    old_material_no = models.CharField(max_length=100, null=True, blank=True)
 
     # Client-specific fields (from your image)
     delivery_to = models.CharField(max_length=255, blank=True)

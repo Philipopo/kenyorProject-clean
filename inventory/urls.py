@@ -5,7 +5,7 @@ from .views import (
     StorageBinViewSet, ItemViewSet, StockRecordViewSet,
     StockMovementViewSet, InventoryAlertViewSet, ExpiryTrackedItemViewSet,
     StockInView, StockOutView, InventoryMetricsView, AnalyticsView, InventoryActivityLogViewSet, ImportCSVView, get_unique_states,
-    get_unique_countries, warehouse_receipt_print
+    get_unique_countries, warehouse_receipt_print, WarehouseReceiptPDFView, WarehouseReceiptViewSet
 )
 
 router = DefaultRouter()
@@ -17,6 +17,7 @@ router.register('movements', StockMovementViewSet, basename='movements')
 router.register('alerts', InventoryAlertViewSet, basename='alerts')
 router.register('expiry-tracked-items', ExpiryTrackedItemViewSet, basename='expiry-tracked-items')
 router.register('activity-logs', InventoryActivityLogViewSet, basename='activity-logs')
+router.register('receipts', WarehouseReceiptViewSet, basename='receipts')
 
 urlpatterns = [
     path('items/import-csv/', ImportCSVView.as_view(), name='import-items-csv'),  # ADD THIS LINE
@@ -30,4 +31,5 @@ urlpatterns = [
     path('warehouse-states/', get_unique_states, name='warehouse-states'),
     path('warehouse-countries/', get_unique_countries, name='warehouse-countries'),
     path('receipts/<int:receipt_id>/print/', warehouse_receipt_print, name='receipt-print'),
+    path('receipts/<int:receipt_id>/pdf/', WarehouseReceiptPDFView.as_view(), name='warehouse-receipt-pdf'),
 ]

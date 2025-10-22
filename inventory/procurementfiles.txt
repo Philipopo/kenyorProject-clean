@@ -1,0 +1,3113 @@
+models.py:
+
+# procurement/models.py
+from django.db import models
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
+from inventory.models import Item, StorageBin
+import uuid
+
+User = get_user_model()
+
+class Vendor(models.Model):
+    STAR_CHOICES = [(i, f"{i} Star{'s' if i > 1 else ''}") for i in range(1, 6)]
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('inactive', 'Inactive'),
+        ('suspended', 'Suspended'),
+        ('blacklisted', 'Blacklisted'),
+    ]
+    
+    name = models.CharField(max_length=255, unique=True)
+    contact_person = models.CharField(max_length=255, blank=True)
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+    address = models.TextField(blank=True)
+    tax_id = models.CharField(max_length=50, blank=True, help_text="Tax/VAT registration number")
+    details = models.TextField(blank=True, null=True)
+    lead_time = models.PositiveIntegerField(help_text="Average lead time in days")
+    ratings = models.IntegerField(choices=STAR_CHOICES, default=3)
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='active')
+    document = models.FileField(upload_to='vendor_documents/', blank=True, null=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='vendors')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+    def clean(self):
+        if self.lead_time <= 0:
+            raise ValidationError("Lead time must be positive.")
+
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'contact_person': self.contact_person,
+            'email': self.email,
+            'phone': self.phone,
+            'status': self.status,
+            'ratings': self.ratings,
+            'lead_time': self.lead_time
+        }
+
+
+
+class ApprovalBoard(models.Model):
+    """Manages users who can approve requisitions and purchase orders"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='approval_board_memberships')
+    can_approve_requisitions = models.BooleanField(default=False)
+    can_approve_purchase_orders = models.BooleanField(default=False)
+    added_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='approval_board_additions')
+    added_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        unique_together = ['user']
+        ordering = ['user__name', 'user__email']
+    
+    def __str__(self):
+        return f"{self.user.email} - Requisitions: {self.can_approve_requisitions}, POs: {self.can_approve_purchase_orders}"
+    
+    def clean(self):
+        if not (self.can_approve_requisitions or self.can_approve_purchase_orders):
+            raise ValidationError("User must be able to approve at least one type of document.")
+
+
+
+
+class Requisition(models.Model):
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('submitted', 'Submitted'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('cancelled', 'Cancelled'),
+        ('completed', 'Completed'),
+    ]
+    
+    code = models.CharField(max_length=100, unique=True, blank=True)
+    department = models.CharField(max_length=100)
+    purpose = models.TextField()
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='draft')
+    priority = models.CharField(max_length=50, choices=[
+        ('low', 'Low'),
+        ('medium', 'Medium'),
+        ('high', 'High'),
+        ('urgent', 'Urgent'),
+    ], default='medium')
+    requested_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='requisitions')
+    approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_requisitions')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_requisitions')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = f"REQ-{uuid.uuid4().hex[:8].upper()}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code}: {self.department} ({self.status})"
+
+    def can_approve(self, user):
+        """Check if user can approve this requisition using ApprovalBoard"""
+        try:
+            approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
+            return approval_member.can_approve_requisitions
+        except ApprovalBoard.DoesNotExist:
+            return False
+
+    
+
+class RequisitionItem(models.Model):
+    requisition = models.ForeignKey(Requisition, on_delete=models.CASCADE, related_name='items')
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='requisition_items')
+    quantity = models.PositiveIntegerField()
+    unit_cost = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    total_cost = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.item.name} x {self.quantity}"
+
+    def save(self, *args, **kwargs):
+        if self.unit_cost and self.quantity:
+            self.total_cost = self.unit_cost * self.quantity
+        super().save(*args, **kwargs)
+
+    def to_dict(self):
+        return {
+            'code': self.code,
+            'department': self.department,
+            'purpose': self.purpose,
+            'status': self.status,
+            'priority': self.priority,
+            'requested_by': self.requested_by.email if self.requested_by else None,
+            'approved_by': self.approved_by.email if self.approved_by else None,
+            'total_items': self.items.count(),
+            'total_cost': sum(item.total_cost or 0 for item in self.items.all())
+        }
+
+
+
+
+class PurchaseOrder(models.Model):
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('submitted', 'Submitted'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('partially_received', 'Partially Received'),
+        ('received', 'Received'),
+        ('cancelled', 'Cancelled'),
+    ]
+    
+    code = models.CharField(max_length=100, unique=True, blank=True, null=True)
+    order_number = models.CharField(max_length=100, blank=True, null=True, help_text="Manual order number (optional)")  # ← ADD THIS
+    requisition = models.ForeignKey(Requisition, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_orders')
+    vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='purchase_orders')
+    department = models.CharField(max_length=100)
+    delivery_address = models.TextField()
+    expected_delivery_date = models.DateField()
+    payment_terms = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='draft')
+    total_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0, null=True, blank=True)
+    tax_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0, null=True, blank=True)
+    discount_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0, null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='purchase_orders')
+    approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_pos')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
+    use_inclusive_pricing = models.BooleanField(default=False, null=True, blank=True)
+    layout = models.CharField(
+        max_length=50,
+        default="default",
+        help_text="Template layout for printing (e.g., 'classic', 'detailed')", null=True, blank=True
+    )
+
+    def _recalculate_totals(self):
+        items = self.items.all()
+        subtotal = sum(item.get_subtotal() for item in items)
+        total_vat = sum(item.get_vat_amount() for item in items)
+        total_discount = sum(item.get_discount_amount() for item in items)
+        
+        # Apply global discount
+        global_discount = subtotal * (self.discount_percent / 100)
+        discounted_subtotal = subtotal - global_discount
+        
+        self.total_amount = discounted_subtotal + total_vat
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = f"PO-{uuid.uuid4().hex[:8].upper()}"
+        # Calculate total amount from PO items
+        if self.pk:
+            self.total_amount = self.items.aggregate(
+                total=models.Sum(models.F('unit_price') * models.F('quantity'))
+            )['total'] or 0
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code} - {self.vendor.name} ({self.status})"
+
+    def can_approve(self, user):
+        """Check if user can approve this purchase order using ApprovalBoard"""
+        try:
+            approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
+            return approval_member.can_approve_purchase_orders
+        except ApprovalBoard.DoesNotExist:
+            return False
+
+
+    def is_fully_received(self):
+        """Check if all PO items have been received"""
+        if not self.items.exists():
+            return False
+        return all(item.received_quantity >= item.quantity for item in self.items.all())
+
+    def to_dict(self):
+        return {
+            'code': self.code,
+            'vendor': self.vendor.name if self.vendor else None,
+            'department': self.department,
+            'status': self.status,
+            'total_amount': float(self.total_amount),
+            'expected_delivery_date': self.expected_delivery_date.isoformat() if self.expected_delivery_date else None,
+            'total_items': self.items.count()
+        }
+
+
+
+
+class POItem(models.Model):
+    po = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name='items')
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='po_items')
+    quantity = models.PositiveIntegerField()
+    received_quantity = models.PositiveIntegerField(default=0)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    total_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='po_items')
+    created_at = models.DateTimeField(auto_now_add=True)
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)  # e.g., 7.5 for 7.5%
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.item.name} x {self.quantity} @ {self.unit_price}"
+
+
+    def clean(self):
+        if self.quantity <= 0:
+            raise ValidationError("Quantity must be positive.")
+        if self.unit_price <= 0:
+            raise ValidationError("Unit price must be positive.")
+        if self.received_quantity > self.quantity:
+            raise ValidationError("Received quantity cannot exceed ordered quantity.")
+
+    def get_subtotal(self):
+        return self.unit_price * self.quantity
+
+    def get_discount_amount(self):
+        return self.get_subtotal() * (self.discount_percent / 100)
+
+    def get_net_amount(self):
+        return self.get_subtotal() - self.get_discount_amount()
+
+    def get_vat_amount(self):
+        return self.get_net_amount() * (self.vat_rate / 100)
+
+    def get_total(self):
+        return self.get_net_amount() + self.get_vat_amount()
+
+    def save(self, *args, **kwargs):
+        self.total_price = self.unit_price * self.quantity
+        super().save(*args, **kwargs)
+
+class Receiving(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('partial', 'Partial'),
+        ('complete', 'Complete'),
+        ('rejected', 'Rejected'),
+    ]
+    
+    po = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name='receivings')
+    grn = models.CharField(max_length=100, unique=True, blank=True)
+    invoice_number = models.CharField(max_length=100)
+    invoice_date = models.DateField()
+    received_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='receivings')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    notes = models.TextField(blank=True)
+    document = models.FileField(upload_to='receipts/', blank=True, null=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_receivings')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        if not self.grn:
+            self.grn = f"GRN-{uuid.uuid4().hex[:8].upper()}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Receiving {self.grn} for {self.po.code}"
+
+    def update_po_status(self):
+        """Update PO status based on receiving status"""
+        po = self.po
+        if po.is_fully_received():
+            po.status = 'received'
+        elif any(r.status == 'complete' for r in po.receivings.all()):
+            po.status = 'partially_received'
+        po.save()
+
+
+
+
+    def to_dict(self):
+        return {
+            'grn': self.grn,
+            'po_code': self.po.code if self.po else None,
+            'invoice_number': self.invoice_number,
+            'status': self.status,
+            'total_items': self.items.count(),
+            'total_received': sum(item.received_quantity for item in self.items.all())
+        }
+
+
+
+
+class ReceivingItem(models.Model):
+    receiving = models.ForeignKey(Receiving, on_delete=models.CASCADE, related_name='items')
+    po_item = models.ForeignKey(POItem, on_delete=models.CASCADE, related_name='receiving_items')
+    received_quantity = models.PositiveIntegerField()
+    accepted_quantity = models.PositiveIntegerField()
+    rejected_quantity = models.PositiveIntegerField(default=0)
+    rejection_reason = models.TextField(blank=True)
+    storage_bin = models.ForeignKey(StorageBin, on_delete=models.SET_NULL, null=True, blank=True, related_name='received_items')
+    batch_number = models.CharField(max_length=100, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.po_item.item.name} x {self.received_quantity}"
+
+    def clean(self):
+        if self.received_quantity <= 0:
+            raise ValidationError("Received quantity must be positive.")
+        if self.accepted_quantity + self.rejected_quantity != self.received_quantity:
+            raise ValidationError("Accepted + Rejected must equal Received quantity.")
+        if self.rejected_quantity > 0 and not self.rejection_reason:
+            raise ValidationError("Rejection reason is required when rejecting items.")
+
+    def save(self, *args, **kwargs):
+        self.rejected_quantity = self.received_quantity - self.accepted_quantity
+        super().save(*args, **kwargs)
+        
+        # Update PO item received quantity
+        self.po_item.received_quantity += self.accepted_quantity
+        self.po_item.save()
+        
+        # Update inventory stock if accepted
+        if self.accepted_quantity > 0 and self.storage_bin:
+            from inventory.models import StockRecord
+            stock_record, created = StockRecord.objects.get_or_create(
+                item=self.po_item.item,
+                storage_bin=self.storage_bin,
+                defaults={'quantity': 0, 'user': self.receiving.created_by}
+            )
+            stock_record.quantity += self.accepted_quantity
+            stock_record.save()
+
+class GoodsReceipt(models.Model):
+    """Legacy model - consider deprecating in favor of Receiving model"""
+    po_code = models.CharField(max_length=100)
+    grn_code = models.CharField(max_length=100)
+    invoice_code = models.CharField(max_length=100)
+    match_success = models.BooleanField(default=False)
+    attachment = models.FileField(upload_to='grn_docs/', blank=True, null=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='goods_receipts')
+
+    def __str__(self):
+        return f"GRN {self.grn_code} for PO {self.po_code}"
+
+# Audit trail for procurement activities
+class ProcurementAuditLog(models.Model):
+    ACTION_CHOICES = [
+        ('create', 'Create'),
+        ('update', 'Update'),
+        ('delete', 'Delete'),
+        ('approve', 'Approve'),
+        ('reject', 'Reject'),
+        ('receive', 'Receive'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    model_name = models.CharField(max_length=50)
+    object_id = models.PositiveIntegerField()
+    details = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email} {self.action} {self.model_name} {self.object_id}"
+
+
+
+class ProcurementAuditLog(models.Model):
+    ACTION_CHOICES = [
+        ('create', 'Create'),
+        ('update', 'Update'),
+        ('delete', 'Delete'),
+        ('approve', 'Approve'),
+        ('reject', 'Reject'),
+        ('receive', 'Receive'),
+        ('submit', 'Submit'),
+        ('cancel', 'Cancel'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    model_name = models.CharField(max_length=50)
+    object_id = models.PositiveIntegerField()
+    details = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+urls:
+
+# procurement/urls.py
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import (
+    VendorViewSet, RequisitionViewSet, PurchaseOrderViewSet, 
+    ReceivingViewSet, ApprovalBoardViewSet, ProcurementAuditLogViewSet
+)
+
+router = DefaultRouter()
+router.register('vendors', VendorViewSet, basename='vendors')
+router.register('requisitions', RequisitionViewSet, basename='requisitions')
+router.register('purchase-orders', PurchaseOrderViewSet, basename='purchase-orders')
+router.register('receivings', ReceivingViewSet, basename='receivings')
+router.register('approval-board', ApprovalBoardViewSet, basename='approval-board')
+router.register('audit-logs', ProcurementAuditLogViewSet, basename='audit-logs')
+
+urlpatterns = [
+    path('', include(router.urls)),
+]
+
+
+
+
+
+
+
+
+seializer.py:
+
+from rest_framework import serializers
+from django.db import transaction
+from django.contrib.auth import get_user_model
+from .models import (
+    Requisition, RequisitionItem, PurchaseOrder, POItem, 
+    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
+)
+from inventory.serializers import ItemSerializer
+User = get_user_model()
+
+class ApprovalBoardSerializer(serializers.ModelSerializer):
+    user_email = serializers.CharField(source='user.email', read_only=True)
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    added_by_name = serializers.CharField(source='added_by.name', read_only=True)
+    
+    class Meta:
+        model = ApprovalBoard
+        fields = '__all__'
+        read_only_fields = ['added_by', 'added_at']
+
+class VendorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Vendor
+        fields = '__all__'
+        read_only_fields = ['created_by', 'created_at', 'updated_at']
+
+    def validate(self, data):
+        if data.get('lead_time', 0) <= 0:
+            raise serializers.ValidationError({'lead_time': 'Lead time must be positive.'})
+        return data
+
+class RequisitionItemSerializer(serializers.ModelSerializer):
+    item_details = ItemSerializer(source='item', read_only=True)
+    
+    class Meta:
+        model = RequisitionItem
+        fields = ['id', 'item', 'item_details', 'quantity', 'unit_cost', 'total_cost', 'notes']
+        read_only_fields = ['total_cost']
+
+    def validate(self, data):
+        if data.get('quantity', 0) <= 0:
+            raise serializers.ValidationError({'quantity': 'Quantity must be positive.'})
+        if data.get('unit_cost', 0) <= 0:
+            raise serializers.ValidationError({'unit_cost': 'Unit cost must be positive.'})
+        return data
+
+
+class RequisitionSerializer(serializers.ModelSerializer):
+    items = RequisitionItemSerializer(many=True, required=False)
+    requested_by_name = serializers.CharField(source='requested_by.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
+    approved_by_name = serializers.CharField(source='approved_by.name', read_only=True)
+    
+    class Meta:
+        model = Requisition
+        fields = '__all__'
+        read_only_fields = [
+            'code', 'approved_by', 'created_at', 'updated_at', 'approved_at',
+            'requested_by', 'created_by'
+        ]
+
+
+    def create(self, validated_data):
+        # Automatically set requested_by and created_by from request user
+        user = self.context['request'].user
+        validated_data['requested_by'] = user
+        validated_data['created_by'] = user
+        items_data = validated_data.pop('items', [])
+        requisition = Requisition.objects.create(**validated_data)
+        
+        for item_data in items_data:
+            RequisitionItem.objects.create(requisition=requisition, **item_data)
+        
+        return requisition
+
+
+
+class POItemSerializer(serializers.ModelSerializer):
+    item_details = ItemSerializer(source='item', read_only=True)
+    
+    class Meta:
+        model = POItem
+        fields = ['id', 'item', 'item_details', 'quantity', 'received_quantity', 'unit_price', 'total_price', 'notes']
+        read_only_fields = ['received_quantity', 'total_price']
+
+    def validate(self, data):
+        if data.get('quantity', 0) <= 0:
+            raise serializers.ValidationError({'quantity': 'Quantity must be positive.'})
+        if data.get('unit_price', 0) <= 0:
+            raise serializers.ValidationError({'unit_price': 'Unit price must be positive.'})
+        return data
+
+class PurchaseOrderSerializer(serializers.ModelSerializer):
+    items = POItemSerializer(many=True, required=False)
+    vendor_details = VendorSerializer(source='vendor', read_only=True)
+    requisition_code = serializers.CharField(source='requisition.code', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
+    
+    class Meta:
+        model = PurchaseOrder
+        fields = '__all__'
+        read_only_fields = [
+            'code', 'total_amount', 'approved_by', 'created_at',
+            'updated_at', 'approved_at', 'created_by'
+        ]
+        # Do NOT include 'layout' in read_only_fields
+
+    def validate(self, data):
+        if not data.get('vendor'):
+            raise serializers.ValidationError({'vendor': 'Vendor is required.'})
+        
+        if self.context['request'].method == 'POST' and data.get('status', 'draft') != 'draft':
+            if not self.initial_data.get('items') or len(self.initial_data.get('items', [])) == 0:
+                raise serializers.ValidationError({'items': 'At least one item is required.'})
+        
+        return data
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        validated_data['created_by'] = self.context['request'].user  # Set created_by
+        po = PurchaseOrder.objects.create(**validated_data)
+        
+        total_amount = 0
+        for index, item_data in enumerate(items_data):
+            try:
+                if 'item' not in item_data:
+                    raise serializers.ValidationError({'item': 'This field is required.'})
+                po_item = POItem.objects.create(po=po, **item_data)
+                total_amount += po_item.total_price
+            except Exception as e:
+                raise serializers.ValidationError({
+                    'items': f'Error in item {index + 1}: {str(e)}'
+                })
+        
+        po.total_amount = total_amount
+        po.save()
+        return po
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        instance = super().update(instance, validated_data)
+        
+        if items_data is not None:
+            instance.items.all().delete()
+            total_amount = 0
+            for index, item_data in enumerate(items_data):
+                try:
+                    if 'item' not in item_data:
+                        raise serializers.ValidationError({'item': 'This field is required.'})
+                    po_item = POItem.objects.create(po=instance, **item_data)
+                    total_amount += po_item.total_price
+                except Exception as e:
+                    raise serializers.ValidationError({
+                        'items': f'Error in item {index + 1}: {str(e)}'
+                    })
+            instance.total_amount = total_amount
+            instance.save()
+        
+        return instance
+
+
+        
+
+class ReceivingItemSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source='po_item.item.name', read_only=True)
+    po_item_details = POItemSerializer(source='po_item', read_only=True)
+    
+    class Meta:
+        model = ReceivingItem
+        fields = '__all__'
+        read_only_fields = ['rejected_quantity', 'receiving']  # ✅ Exclude from input
+
+    def validate(self, data):
+        po_item = data.get('po_item')
+        received_quantity = data.get('received_quantity', 0)
+        accepted_quantity = data.get('accepted_quantity', 0)
+        
+        if received_quantity <= 0:
+            raise serializers.ValidationError({'received_quantity': 'Received quantity must be positive.'})
+        
+        if accepted_quantity < 0:
+            raise serializers.ValidationError({'accepted_quantity': 'Accepted quantity cannot be negative.'})
+        
+        if accepted_quantity > received_quantity:
+            raise serializers.ValidationError({'accepted_quantity': 'Accepted quantity cannot exceed received quantity.'})
+        
+        if accepted_quantity > 0 and not data.get('storage_bin'):
+            raise serializers.ValidationError({'storage_bin': 'Storage bin is required for accepted items.'})
+        
+        if received_quantity > (po_item.quantity - po_item.received_quantity):
+            raise serializers.ValidationError({
+                'received_quantity': f'Cannot receive more than remaining quantity. Remaining: {po_item.quantity - po_item.received_quantity}'
+            })
+        
+        return data
+
+
+class ReceivingSerializer(serializers.ModelSerializer):
+    items = ReceivingItemSerializer(many=True, required=False)
+    po_code = serializers.CharField(source='po.code', read_only=True)
+    vendor_name = serializers.CharField(source='po.vendor.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.name', read_only=True)
+    
+    class Meta:
+        model = Receiving
+        fields = '__all__'
+        read_only_fields = [
+            'grn', 'created_at', 'updated_at', 
+            'created_by', 'received_by'  # ✅ Make it read-only
+        ]
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        
+        # Create the Receiving instance FIRST
+        receiving = Receiving.objects.create(
+            po=validated_data['po'],
+            invoice_number=validated_data['invoice_number'],
+            invoice_date=validated_data['invoice_date'],
+            notes=validated_data.get('notes', ''),
+            received_by=self.context['request'].user,  # ✅ Auto-set from JWT
+            created_by=self.context['request'].user
+        )
+        
+        # THEN create ReceivingItems linked to it
+        for item_data in items_data:
+            ReceivingItem.objects.create(
+                receiving=receiving,  # ✅ Link to parent
+                **item_data
+            )
+        
+        receiving.update_po_status()
+        return receiving
+
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        instance = super().update(instance, validated_data)
+        
+        if items_data is not None:
+            # Clear existing items and add new ones
+            instance.items.all().delete()
+            for item_data in items_data:
+                ReceivingItem.objects.create(receiving=instance, **item_data)
+            
+            # Update PO status
+            instance.update_po_status()
+        
+        return instance
+
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        
+        # Create Receiving FIRST (without items)
+        receiving = Receiving.objects.create(
+            po=validated_data['po'],
+            invoice_number=validated_data['invoice_number'],
+            invoice_date=validated_data['invoice_date'],
+            notes=validated_data.get('notes', ''),
+            received_by=self.context['request'].user,
+            created_by=self.context['request'].user
+        )
+        
+        # THEN create ReceivingItems linked to it
+        for item_data in items_data:
+            ReceivingItem.objects.create(
+                receiving=receiving,
+                **item_data
+            )
+        
+        receiving.update_po_status()
+        return receiving
+
+        
+
+class ProcurementAuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProcurementAuditLog
+        fields = '__all__'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+view.py:
+
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Q, Sum
+from django.http import HttpResponse
+from django.conf import settings
+from datetime import datetime
+from io import BytesIO
+
+# ReportLab imports for PDF generation
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+
+from .models import (
+    Requisition, RequisitionItem, PurchaseOrder, POItem, 
+    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
+)
+from .serializers import (
+    RequisitionSerializer, PurchaseOrderSerializer, 
+    ReceivingSerializer, VendorSerializer, ProcurementAuditLogSerializer, ApprovalBoardSerializer
+)
+from accounts.permissions import DynamicPermission
+from rest_framework.pagination import PageNumberPagination
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
+# Define pagination class FIRST, before any viewsets that use it
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+# TEMPORARILY COMMENTED OUT - Audit logging disabled for deadline
+# def log_procurement_action(user, action, model_name, object_id, details=None, instance=None):
+#     """
+#     Comprehensive audit logging function
+#     """
+#     from .models import ProcurementAuditLog
+#     
+#     log_details = details or {}
+#     
+#     # Add instance details if available
+#     if instance:
+#         if hasattr(instance, 'to_dict'):
+#             log_details['object_data'] = instance.to_dict()
+#         else:
+#             # Generic serialization
+#             try:
+#                 from django.forms.models import model_to_dict
+#                 log_details['object_data'] = model_to_dict(instance)
+#             except:
+#                 log_details['object_data'] = str(instance)
+#     
+#     # Create audit log
+#     ProcurementAuditLog.objects.create(
+#         user=user,
+#         action=action,
+#         model_name=model_name,
+#         object_id=object_id,
+#         details=log_details
+#     )
+
+class ApprovalBoardViewSet(viewsets.ModelViewSet):
+    queryset = ApprovalBoard.objects.select_related('user', 'added_by')
+    serializer_class = ApprovalBoardSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'approval_board'
+    pagination_class = StandardResultsSetPagination
+    required_permissions = {
+        'create': 'add_approval_board_member',
+        'update': 'update_approval_board_member',
+        'partial_update': 'update_approval_board_member',
+        'destroy': 'delete_approval_board_member',
+    }
+
+    def get_queryset(self):
+        queryset = ApprovalBoard.objects.select_related('user', 'added_by').filter(is_active=True)
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(user__email__icontains=search) | 
+                Q(user__name__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        instance = serializer.save(added_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='ApprovalBoard',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'operation': 'Added approval board member'}
+        # )
+
+    def perform_update(self, serializer):
+        instance = serializer.save(added_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='update',
+        #     model_name='ApprovalBoard',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'operation': 'Updated approval board member'}
+        # )
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else str(instance)
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='ApprovalBoard',
+        #     object_id=instance_id,
+        #     details={'operation': 'Deleted approval board member', 'deleted_data': instance_data}
+        # )
+
+class VendorViewSet(viewsets.ModelViewSet):
+    queryset = Vendor.objects.all()
+    serializer_class = VendorSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'vendors'
+    pagination_class = StandardResultsSetPagination
+    required_permissions = {
+        'create': 'add_vendor',
+        'update': 'update_vendor',
+        'partial_update': 'update_vendor',
+        'destroy': 'delete_vendor',
+    }
+
+    def get_queryset(self):
+        queryset = Vendor.objects.all()
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(Q(name__icontains=search) | Q(contact_person__icontains=search))
+        return queryset
+
+    def perform_create(self, serializer):
+        instance = serializer.save(created_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='Vendor',
+        #     object_id=instance.id,
+        #     instance=instance
+        # )
+
+    def perform_update(self, serializer):
+        instance = serializer.save(created_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='update',
+        #     model_name='Vendor',
+        #     object_id=instance.id,
+        #     instance=instance
+        # )
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'name': instance.name,
+            'email': instance.email
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='Vendor',
+        #     object_id=instance_id,
+        #     details={'deleted_vendor': instance_data}
+        # )
+
+class RequisitionViewSet(viewsets.ModelViewSet):
+    queryset = Requisition.objects.all()
+    serializer_class = RequisitionSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'requisitions'
+    pagination_class = StandardResultsSetPagination
+    required_permissions = {
+        'create': 'create_requisition',
+        'update': 'update_requisition',
+        'partial_update': 'update_requisition',
+        'destroy': 'delete_requisition',
+    }
+
+    def get_queryset(self):
+        queryset = Requisition.objects.select_related(
+            'requested_by', 'created_by', 'approved_by'
+        ).prefetch_related('items__item')
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(code__icontains=search) |
+                Q(department__icontains=search) |
+                Q(purpose__icontains=search)
+            )
+        return queryset
+
+    @action(detail=False, methods=['get'])
+    def approval_board(self, request):
+        """Get comprehensive approval board information for frontend workflow"""
+        user = request.user
+        
+        # Get user's approval capabilities
+        try:
+            user_approval = ApprovalBoard.objects.get(user=user, is_active=True)
+            can_approve_requisitions = user_approval.can_approve_requisitions
+            can_approve_pos = user_approval.can_approve_purchase_orders
+        except ApprovalBoard.DoesNotExist:
+            can_approve_requisitions = False
+            can_approve_pos = False
+        
+        # Get all active approval board members
+        approval_board = ApprovalBoard.objects.filter(
+            is_active=True
+        ).select_related('user')
+        
+        # Count pending items for the current user
+        pending_requisitions = 0
+        pending_pos = 0
+        
+        if can_approve_requisitions:
+            pending_requisitions = Requisition.objects.filter(
+                status='submitted'
+            ).count()
+        
+        if can_approve_pos:
+            pending_pos = PurchaseOrder.objects.filter(
+                status='submitted'
+            ).count()
+        
+        # Serialize approval board members
+        board_members = []
+        for member in approval_board:
+            board_members.append({
+                'id': member.id,
+                'user_id': member.user.id,
+                'user_email': member.user.email,
+                'user_name': member.user.name,
+                'can_approve_requisitions': member.can_approve_requisitions,
+                'can_approve_purchase_orders': member.can_approve_purchase_orders,
+                'is_active': member.is_active,
+                'date_added': member.added_at.isoformat() if member.added_at else None
+            })
+        
+        return Response({
+            'current_user': {
+                'can_approve_requisitions': can_approve_requisitions,
+                'can_approve_purchase_orders': can_approve_pos,
+                'pending_requisitions': pending_requisitions,
+                'pending_purchase_orders': pending_pos
+            },
+            'approval_board_members': board_members,
+            'total_approvers': len(board_members)
+        })
+
+    def perform_create(self, serializer):
+        instance = serializer.save(
+            created_by=self.request.user,
+            requested_by=self.request.user
+        )
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='Requisition',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'status': 'draft'}
+        # )
+
+    def perform_update(self, serializer):
+        old_status = self.get_object().status
+        instance = serializer.save(created_by=self.request.user)
+        new_status = instance.status
+        
+        # Log status changes specifically
+        if old_status != new_status:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Requisition',
+            #     object_id=instance.id,
+            #     instance=instance,
+            #     details={'status_change': f'{old_status} -> {new_status}'}
+            # )
+            pass
+        else:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Requisition',
+            #     object_id=instance.id,
+            #     instance=instance
+            # )
+            pass
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'code': instance.code,
+            'department': instance.department
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='Requisition',
+        #     object_id=instance_id,
+        #     details={'deleted_requisition': instance_data}
+        # )
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        requisition = self.get_object()
+        if not requisition.can_approve(request.user):
+            return Response({'error': 'You do not have permission to approve this requisition.'}, 
+                        status=status.HTTP_403_FORBIDDEN)
+        
+        requisition.status = 'approved'
+        requisition.approved_by = request.user
+        requisition.approved_at = datetime.now()
+        requisition.save()
+        
+        # TEMPORARILY COMMENTED OUT - Manual audit log creation disabled
+        # Convert datetime to string for JSON serialization
+        # approved_at_str = requisition.approved_at.isoformat() if requisition.approved_at else None
+        # 
+        # ProcurementAuditLog.objects.create(
+        #     user=request.user,
+        #     action='approve',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     details={
+        #         'status': 'approved',
+        #         'approved_at': approved_at_str,
+        #         'requisition_code': requisition.code
+        #     }
+        # )
+        
+        return Response({'status': 'approved'})
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        requisition = self.get_object()
+        if not requisition.can_approve(request.user):
+            return Response({'error': 'You do not have permission to reject this requisition.'}, 
+                          status=status.HTTP_403_FORBIDDEN)
+        
+        old_status = requisition.status
+        requisition.status = 'rejected'
+        requisition.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='reject',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     instance=requisition,
+        #     details={'status_change': f'{old_status} -> rejected'}
+        # )
+        
+        return Response({'status': 'rejected'})
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Submit requisition for approval"""
+        requisition = self.get_object()
+        if requisition.status != 'draft':
+            return Response({'error': 'Only draft requisitions can be submitted.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = requisition.status
+        requisition.status = 'submitted'
+        requisition.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='submit',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     instance=requisition,
+        #     details={'status_change': f'{old_status} -> submitted'}
+        # )
+        
+        return Response({'status': 'submitted'})
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel requisition"""
+        requisition = self.get_object()
+        if requisition.status in ['approved', 'completed']:
+            return Response({'error': 'Cannot cancel approved or completed requisitions.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = requisition.status
+        requisition.status = 'cancelled'
+        requisition.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='cancel',
+        #     model_name='Requisition',
+        #     object_id=requisition.id,
+        #     instance=requisition,
+        #     details={'status_change': f'{old_status} -> cancelled'}
+        # )
+        
+        return Response({'status': 'cancelled'})
+
+class PurchaseOrderViewSet(viewsets.ModelViewSet):
+    queryset = PurchaseOrder.objects.all()
+    serializer_class = PurchaseOrderSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'purchase_orders'
+    pagination_class = StandardResultsSetPagination
+    required_permissions = {
+        'create': 'create_purchase_order',
+        'update': 'update_purchase_order',
+        'partial_update': 'update_purchase_order',
+        'destroy': 'delete_purchase_order',
+    }
+
+    def get_queryset(self):
+        queryset = PurchaseOrder.objects.select_related(
+            'vendor', 'created_by', 'approved_by', 'requisition'
+        ).prefetch_related('items__item')
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(code__icontains=search) |
+                Q(vendor__name__icontains=search) |
+                Q(department__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        instance = serializer.save(created_by=self.request.user)
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='PurchaseOrder',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'status': 'draft'}
+        # )
+
+    def perform_update(self, serializer):
+        old_status = self.get_object().status
+        instance = serializer.save(created_by=self.request.user)
+        new_status = instance.status
+        
+        if old_status != new_status:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='PurchaseOrder',
+            #     object_id=instance.id,
+            #     instance=instance,
+            #     details={'status_change': f'{old_status} -> {new_status}'}
+            # )
+            pass
+        else:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='PurchaseOrder',
+            #     object_id=instance.id,
+            #     instance=instance
+            # )
+            pass
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'code': instance.code,
+            'vendor': instance.vendor.name if instance.vendor else None
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='PurchaseOrder',
+        #     object_id=instance_id,
+        #     details={'deleted_po': instance_data}
+        # )
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        po = self.get_object()
+        if not po.can_approve(request.user):
+            return Response({'error': 'You do not have permission to approve this purchase order.'}, 
+                          status=status.HTTP_403_FORBIDDEN)
+        
+        old_status = po.status
+        po.status = 'approved'
+        po.approved_by = request.user
+        po.approved_at = datetime.now()
+        po.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='approve',
+        #     model_name='PurchaseOrder',
+        #     object_id=po.id,
+        #     instance=po,
+        #     details={'status_change': f'{old_status} -> approved'}
+        # )
+        
+        return Response({'status': 'approved'})
+
+    @action(detail=True, methods=['get'])
+    def export_pdf(self, request, pk=None):
+        """Export Purchase Order as PDF with Kenyon-branded styling"""
+        po = self.get_object()
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch
+        )
+        elements = []
+        styles = getSampleStyleSheet()
+
+        # --- Custom styles ---
+        title_style = ParagraphStyle(
+            'ReceiptTitle', parent=styles['Heading1'],
+            fontSize=16, alignment=1, spaceAfter=8, leading=20,
+            textColor=colors.HexColor("#333333")
+        )
+        section_heading = ParagraphStyle(
+            'SectionHeading', parent=styles['Heading3'],
+            fontSize=10.5, spaceBefore=6, spaceAfter=6,
+            textColor=colors.HexColor("#2b2b2b"), leading=13
+        )
+        small_info = ParagraphStyle(
+            'SmallInfo', parent=styles['Normal'],
+            fontSize=9, leading=12, textColor=colors.black
+        )
+
+        # === Header Section ===
+        if hasattr(settings, 'COMPANY_LOGO_PATH'):
+            try:
+                from reportlab.platypus import Image
+                logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.5*inch, height=0.8*inch)
+
+                header_table = Table([[
+                    logo_img,
+                    Paragraph(
+                        f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/>"
+                        f"<span>{getattr(settings, 'COMPANY_ADDRESS', '')}</span>",
+                        styles['Title']
+                    ),
+                    Paragraph(
+                        f"<b>PO No.</b><br/>{po.code or '—'}<br/><br/>"
+                        f"<b>Date</b><br/>{po.created_at.strftime('%d/%m/%Y')}",
+                        small_info
+                    )
+                ]], colWidths=[1.5*inch, 3.8*inch, 2.2*inch])
+
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+            except Exception as e:
+                logger.warning(f"Logo not found: {str(e)}")
+                # Fallback without logo
+                header_table = Table([[
+                    Paragraph(
+                        f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/>"
+                        f"<span>{getattr(settings, 'COMPANY_ADDRESS', '')}</span>",
+                        styles['Title']
+                    ),
+                    Paragraph(
+                        f"<b>PO No.</b><br/>{po.code or '—'}<br/><br/>"
+                        f"<b>Date</b><br/>{po.created_at.strftime('%d/%m/%Y')}",
+                        small_info
+                    )
+                ]], colWidths=[5.0*inch, 2.2*inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+        else:
+            # No logo path defined
+            header_table = Table([[
+                Paragraph(
+                    f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/>"
+                    f"<span>{getattr(settings, 'COMPANY_ADDRESS', '')}</span>",
+                    styles['Title']
+                ),
+                Paragraph(
+                    f"<b>PO No.</b><br/>{po.code or '—'}<br/><br/>"
+                    f"<b>Date</b><br/>{po.created_at.strftime('%d/%m/%Y')}",
+                    small_info
+                )
+            ]], colWidths=[5.0*inch, 2.2*inch])
+            header_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+            ]))
+            elements.append(header_table)
+            elements.append(Spacer(1, 12))
+
+        # === Main Title ===
+        elements.append(Paragraph("PURCHASE ORDER", title_style))
+        elements.append(Spacer(1, 8))
+
+        # === Supplier Details ===
+        elements.append(Paragraph("<b>SUPPLIER DETAILS</b>", section_heading))
+        elements.append(Spacer(1, 6))
+        supplier_data = [
+            ["Supplier", po.vendor.name if po.vendor else "—"],
+            ["VAT Reference", po.vendor.tax_id or "—"],
+            ["Physical Address", po.vendor.address or "—"],
+            ["Contact", f"{po.vendor.contact_person or '—'} | {po.vendor.phone or '—'}"],
+        ]
+        supplier_table = Table(supplier_data, colWidths=[2.0*inch, 4.1*inch])
+        supplier_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(supplier_table)
+        elements.append(Spacer(1, 12))
+
+        # === PO Details ===
+        elements.append(Paragraph("<b>PURCHASE ORDER DETAILS</b>", section_heading))
+        elements.append(Spacer(1, 6))
+        po_details = [
+            ["PO Number", po.code or "—"],
+            ["Department", po.department or "—"],
+            ["Delivery Address", po.delivery_address or "—"],
+            ["Expected Delivery", po.expected_delivery_date.strftime('%d/%m/%Y') if po.expected_delivery_date else "—"],
+            ["Payment Terms", po.payment_terms or "—"],
+            ["Status", po.get_status_display() or "—"],
+        ]
+        po_table = Table(po_details, colWidths=[2.0*inch, 4.1*inch])
+        po_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(po_table)
+        elements.append(Spacer(1, 12))
+
+        # === Items Table ===
+        elements.append(Paragraph("<b>ITEMS</b>", section_heading))
+        elements.append(Spacer(1, 6))
+
+        item_headers = ["Item", "Description", "Qty", "Unit Price (₦)", "Total (₦)"]
+        item_data = [item_headers]
+
+        total_amount = 0
+        for item in po.items.all():
+            total = item.quantity * item.unit_price
+            total_amount += total
+            item_data.append([
+                item.item.name if item.item else "—",
+                getattr(item, 'notes', '') or "—",
+                str(item.quantity),
+                f"{item.unit_price:.2f}",
+                f"{total:.2f}"
+            ])
+
+        # Add total row
+        item_data.append(["", "", "", "TOTAL:", f"{total_amount:.2f}"])
+
+        item_table = Table(item_data, colWidths=[1.2*inch, 2.0*inch, 0.8*inch, 1.0*inch, 1.1*inch])
+        item_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#E0E0E0")),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -2), 0.35, colors.HexColor("#D0D0D0")),
+            ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#F6F6F6")),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(item_table)
+        elements.append(Spacer(1, 12))
+
+        # === Message ===
+        if po.notes:
+            elements.append(Paragraph("<b>MESSAGE</b>", section_heading))
+            elements.append(Spacer(1, 6))
+            elements.append(Paragraph(po.notes, styles['Normal']))
+            elements.append(Spacer(1, 12))
+
+        # === Footer ===
+        footer_table = Table([[
+            Paragraph("<i>This document is auto-generated. Signatures are required for validation.</i>", styles['Italic']),
+            Paragraph(f"{getattr(settings, 'COMPANY_NAME', '')}", small_info)
+        ]], colWidths=[4.6*inch, 2.0*inch])
+        footer_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#333333")),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.whitesmoke),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(footer_table)
+
+        # Build PDF
+        doc.build(elements)
+
+        # Filename
+        filename = f"PO_{po.code}_kenyon_receipt.pdf"
+        buffer.seek(0)
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
+
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Submit PO for approval"""
+        po = self.get_object()
+        if po.status != 'draft':
+            return Response({'error': 'Only draft POs can be submitted.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = po.status
+        po.status = 'submitted'
+        po.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='submit',
+        #     model_name='PurchaseOrder',
+        #     object_id=po.id,
+        #     instance=po,
+        #     details={'status_change': f'{old_status} -> submitted'}
+        # )
+        
+        return Response({'status': 'submitted'})
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel PO"""
+        po = self.get_object()
+        if po.status in ['approved', 'received']:
+            return Response({'error': 'Cannot cancel approved or received POs.'}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+        
+        old_status = po.status
+        po.status = 'cancelled'
+        po.save()
+        
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=request.user,
+        #     action='cancel',
+        #     model_name='PurchaseOrder',
+        #     object_id=po.id,
+        #     instance=po,
+        #     details={'status_change': f'{old_status} -> cancelled'}
+        # )
+        
+        return Response({'status': 'cancelled'})
+
+class ReceivingViewSet(viewsets.ModelViewSet):
+    queryset = Receiving.objects.all()
+    serializer_class = ReceivingSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'receiving'
+    pagination_class = StandardResultsSetPagination
+    required_permissions = {
+        'create': 'create_receiving',
+        'update': 'update_receiving',
+        'partial_update': 'update_receiving',
+        'destroy': 'delete_receiving',
+    }
+
+    def get_queryset(self):
+        queryset = Receiving.objects.select_related(
+            'po', 'po__vendor', 'received_by', 'created_by'
+        ).prefetch_related('items__po_item__item')
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(grn__icontains=search) |
+                Q(po__code__icontains=search) |
+                Q(invoice_number__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        instance = serializer.save(
+            created_by=self.request.user,
+            received_by=self.request.user
+        )
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='create',
+        #     model_name='Receiving',
+        #     object_id=instance.id,
+        #     instance=instance,
+        #     details={'status': instance.status}
+        # )
+        # Update PO status is already handled in model
+
+    def perform_update(self, serializer):
+        old_status = self.get_object().status
+        instance = serializer.save(created_by=self.request.user)
+        new_status = instance.status
+        
+        if old_status != new_status:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Receiving',
+            #     object_id=instance.id,
+            #     instance=instance,
+            #     details={'status_change': f'{old_status} -> {new_status}'}
+            # )
+            pass
+        else:
+            # TEMPORARILY COMMENTED OUT - Audit logging disabled
+            # log_procurement_action(
+            #     user=self.request.user,
+            #     action='update',
+            #     model_name='Receiving',
+            #     object_id=instance.id,
+            #     instance=instance
+            # )
+            pass
+
+    def perform_destroy(self, instance):
+        instance_id = instance.id
+        instance_data = instance.to_dict() if hasattr(instance, 'to_dict') else {
+            'grn': instance.grn,
+            'po_code': instance.po.code if instance.po else None
+        }
+        instance.delete()
+        # TEMPORARILY COMMENTED OUT - Audit logging disabled
+        # log_procurement_action(
+        #     user=self.request.user,
+        #     action='delete',
+        #     model_name='Receiving',
+        #     object_id=instance_id,
+        #     details={'deleted_receiving': instance_data}
+        # )
+    def perform_create(self, serializer):
+        # Auto-set received_by and created_by from request user
+        instance = serializer.save(
+            received_by=self.request.user,
+            created_by=self.request.user
+        )
+        # Update PO status is already handled in model
+
+
+        
+class ProcurementAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = ProcurementAuditLog.objects.all()
+    serializer_class = ProcurementAuditLogSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'procurement_audit_logs'
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = ProcurementAuditLog.objects.select_related('user')
+        # Add filtering capabilities
+        model_name = self.request.query_params.get('model_name', None)
+        action = self.request.query_params.get('action', None)
+        user_id = self.request.query_params.get('user_id', None)
+        
+        if model_name:
+            queryset = queryset.filter(model_name__icontains=model_name)
+        if action:
+            queryset = queryset.filter(action=action)
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+            
+        return queryset.order_by('-created_at')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+purchasing order.jsx:
+// src/pages/procurement/Orders.jsx
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  Container,
+  Paper,
+  Typography,
+  Button,
+  Box,
+  Grid,
+  Divider,
+  Alert,
+  Table,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableBody,
+  TableContainer,
+  Pagination,
+  IconButton,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  CircularProgress,
+  InputAdornment,
+  Chip,
+  TextField,
+  Autocomplete,
+  Collapse,
+  Card,
+  CardContent,
+  CardHeader,
+  Tooltip,
+  MenuItem,
+} from '@mui/material';
+import {
+  Add as AddIcon,
+  Search as SearchIcon,
+  Edit as EditIcon,
+  Send as SendIcon,
+  Info as InfoIcon,
+  Close as CloseIcon,
+  Cancel as CancelIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+  PictureAsPdf as PictureAsPdfIcon,
+  ThumbUp as ThumbUpIcon,
+  ThumbDown as ThumbDownIcon,
+  Delete as DeleteIcon,
+} from '@mui/icons-material';
+import { debounce } from 'lodash';
+import API from '../../api';
+import { useSearch } from '../../context/SearchContext';
+
+const STATUS_COLORS = {
+  draft: 'default',
+  submitted: 'info',
+  approved: 'success',
+  rejected: 'error',
+  partially_received: 'warning',
+  received: 'success',
+  cancelled: 'error',
+};
+
+function PurchaseOrderRow({ po, onEdit, onDelete, onSubmitForApproval, onApprove, onReject, onExportPDF, permissions, loading, formatCurrency }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      <TableRow sx={{ '& > *': { borderBottom: 'unset' }, cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+        <TableCell>
+          <IconButton size="small" onClick={(e) => { e.stopPropagation(); setOpen(!open); }}>
+            {open ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+          </IconButton>
+        </TableCell>
+        <TableCell>
+          <Tooltip title="Purchase Order Code">
+            <strong>{po.code}</strong>
+          </Tooltip>
+        </TableCell>
+        <TableCell>{po.vendor?.name || 'N/A'}</TableCell>
+        <TableCell>{po.department}</TableCell>
+        <TableCell>
+          <Chip
+            label={po.status.replace('_', ' ').replace(/\b\w/g, (l) => l.toUpperCase())}
+            size="small"
+            color={STATUS_COLORS[po.status] || 'default'}
+          />
+        </TableCell>
+        <TableCell>{formatCurrency(po.total_amount)}</TableCell>
+        <TableCell>{new Date(po.created_at).toLocaleDateString()}</TableCell>
+        <TableCell>
+          <IconButton
+            onClick={(e) => { e.stopPropagation(); onEdit(po); }}
+            disabled={!permissions.update_purchase_order || po.status !== 'draft' || loading}
+            title="Edit PO (only for drafts)"
+          >
+            <EditIcon />
+          </IconButton>
+        
+          
+          <IconButton
+            onClick={(e) => { e.stopPropagation(); onExportPDF(po.id); }}
+            disabled={loading}
+            title="Export as PDF"
+          >
+            <PictureAsPdfIcon />
+          </IconButton>
+          <IconButton
+            onClick={(e) => { e.stopPropagation(); onDelete(po.id); }}
+            disabled={!permissions.delete_purchase_order || po.status !== 'draft' || loading}
+            title="Delete PO (only for drafts)"
+            color="error"
+          >
+            <DeleteIcon />
+          </IconButton>
+        </TableCell>
+      </TableRow>
+      <TableRow>
+        <TableCell colSpan={8} style={{ paddingBottom: 0, paddingTop: 0 }}>
+          <Collapse in={open} timeout="auto" unmountOnExit>
+            <Box sx={{ margin: 2 }}>
+              <Typography variant="h6">Purchase Order Details</Typography>
+              <Grid container spacing={2}>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Requisition:</strong> {po.requisition?.code || 'N/A'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Delivery Address:</strong> {po.delivery_address || '—'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Expected Delivery:</strong> {po.expected_delivery_date || '—'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Payment Terms:</strong> {po.payment_terms || '—'}</Typography>
+                </Grid>
+                <Grid item xs={12}>
+                  <Typography><strong>Notes:</strong> {po.notes || '—'}</Typography>
+                </Grid>
+                <Grid item xs={12}>
+                  <Typography><strong>Items:</strong></Typography>
+                  {po.items?.length ? (
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Item</TableCell>
+                          <TableCell>Quantity</TableCell>
+                          <TableCell>Unit Price</TableCell>
+                          <TableCell>Total</TableCell>
+                          <TableCell>Notes</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {po.items.map((item, index) => (
+                          <TableRow key={index}>
+                            <TableCell>{item.item?.name || 'Unknown Item'}</TableCell>
+                            <TableCell>{item.quantity}</TableCell>
+                            <TableCell>{formatCurrency(item.unit_price)}</TableCell>
+                            <TableCell>{formatCurrency(item.quantity * item.unit_price)}</TableCell>
+                            <TableCell>{item.notes || '—'}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  ) : (
+                    <Typography>—</Typography>
+                  )}
+                </Grid>
+              </Grid>
+            </Box>
+          </Collapse>
+        </TableCell>
+      </TableRow>
+    </>
+  );
+}
+
+export default function PurchaseOrders() {
+  const [purchaseOrders, setPurchaseOrders] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [alert, setAlert] = useState(null);
+  const [modalAlert, setModalAlert] = useState(null);
+  const [checkingPermissions, setCheckingPermissions] = useState(true);
+  const [hasPermission, setHasPermission] = useState(false);
+  const [permissions, setPermissions] = useState({
+    create_purchase_order: false,
+    update_purchase_order: false,
+    delete_purchase_order: false,
+  });
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [search, setSearch] = useState('');
+  const [openDeleteDialog, setOpenDeleteDialog] = useState(false);
+  const [deleteId, setDeleteId] = useState(null);
+  const { searchTerm } = useSearch();
+  const itemsPerPage = 10;
+  const prevSearchTermRef = useRef(searchTerm);
+  const prevSearchRef = useRef(search);
+
+  // Modal states
+  const [openModal, setOpenModal] = useState(false);
+  const [modalMode, setModalMode] = useState('create'); // 'create' or 'edit'
+  const [selectedPO, setSelectedPO] = useState(null);
+
+  // Form state
+  const [formData, setFormData] = useState({
+    requisition: null,
+    vendor: null,
+    department: '',
+    delivery_address: '',
+    expected_delivery_date: '',
+    payment_terms: '',
+    notes: '',
+    items: [],
+  });
+
+  // New item form state
+  const [newItem, setNewItem] = useState({
+    item: null,
+    quantity: '',
+    unit_price: '',
+    notes: '',
+  });
+
+  // Data for dropdowns
+  const [requisitions, setRequisitions] = useState([]);
+  const [vendors, setVendors] = useState([]);
+  const [inventoryItems, setInventoryItems] = useState([]);
+
+  // Tutorial state
+  const [showTutorial, setShowTutorial] = useState(false);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const debouncedSetSearch = useCallback(
+    debounce((value) => {
+      setSearch(value);
+      setPage(1);
+    }, 500),
+    []
+  );
+
+  // Format currency in Naira
+  const formatCurrency = (value) => {
+    return new Intl.NumberFormat('en-NG', {
+      style: 'currency',
+      currency: 'NGN',
+      minimumFractionDigits: 2,
+    }).format(value);
+  };
+
+  // Calculate total amount for PO
+  const calculateTotalAmount = (items) => {
+    return items.reduce((total, item) => total + (item.quantity * (item.unit_price || 0)), 0);
+  };
+
+  // Fetch purchase orders
+  const fetchPurchaseOrders = useCallback(async () => {
+    try {
+      setLoading(true);
+      const searchValue = search || searchTerm;
+      console.log('Fetching purchase orders with params:', { search: searchValue, page, page_size: itemsPerPage });
+      const res = await API.get('procurement/purchase-orders/', {
+        params: { search: searchValue, page, page_size: itemsPerPage },
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      console.log('Purchase orders API response:', res.data);
+      setPurchaseOrders(res.data.results || res.data || []);
+      setTotalPages(Math.ceil((res.data.count || res.data.length || 0) / itemsPerPage));
+      setAlert(null);
+    } catch (err) {
+      console.error('Error fetching purchase orders:', err.response?.data || err.message);
+      setAlert(`❌ Failed to fetch purchase orders: ${err.response?.data?.detail || err.message}`);
+      setPurchaseOrders([]);
+      setTotalPages(1);
+    } finally {
+      setLoading(false);
+    }
+  }, [search, searchTerm, page, itemsPerPage]);
+
+  // Fetch approved requisitions for dropdown
+  const fetchApprovedRequisitions = useCallback(async () => {
+    try {
+      const res = await API.get('procurement/requisitions/', {
+        params: { status: 'approved', page_size: 1000 },
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      console.log('Requisitions API response:', res.data);
+      const approvedReqs = (res.data.results || res.data || []).filter((req) => req.status === 'approved');
+      setRequisitions(approvedReqs);
+    } catch (err) {
+      console.error('Error fetching approved requisitions:', err.response?.data || err.message);
+      setAlert(`❌ Failed to fetch requisitions: ${err.response?.data?.detail || err.message}`);
+    }
+  }, []);
+
+  // Fetch vendors for dropdown
+  const fetchVendors = useCallback(async () => {
+    try {
+      const res = await API.get('procurement/vendors/', {
+        params: { status: 'active', page_size: 1000 },
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      console.log('Vendors API response:', res.data);
+      setVendors(res.data.results || res.data || []);
+    } catch (err) {
+      console.error('Error fetching vendors:', err.response?.data || err.message);
+      setAlert(`❌ Failed to fetch vendors: ${err.response?.data?.detail || err.message}`);
+    }
+  }, []);
+
+  // Fetch inventory items for autocomplete
+  const fetchInventoryItems = useCallback(async () => {
+    try {
+      const res = await API.get('inventory/items/', {
+        params: { page_size: 1000 },
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      console.log('Inventory items API response:', res.data);
+      setInventoryItems(res.data.results || res.data || []);
+    } catch (err) {
+      console.error('Error fetching inventory items:', err.response?.data || err.message);
+      setAlert(`❌ Failed to fetch inventory items: ${err.response?.data?.detail || err.message}`);
+    }
+  }, []);
+
+  // Check permissions and fetch data
+  useEffect(() => {
+    const checkPermissions = async () => {
+      try {
+        const token = localStorage.getItem('accessToken');
+        if (!token) {
+          setAlert('⚠️ No authentication token found. Please log in.');
+          setHasPermission(false);
+          setCheckingPermissions(false);
+          return;
+        }
+
+        // Check page-level permission
+        const pageResponse = await API.get('/auth/permissions/page/purchase_orders/', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setHasPermission(pageResponse.data.allowed || false);
+
+        if (!pageResponse.data.allowed) {
+          setAlert(`⚠️ You do not have permission to view this page: ${pageResponse.data.reason || 'No reason provided'}`);
+          setCheckingPermissions(false);
+          return;
+        }
+
+        // Fetch all action permissions in parallel
+        const actions = ['create_purchase_order', 'update_purchase_order', 'delete_purchase_order'];
+        const permissionPromises = actions.map((action) =>
+          API.get(`/auth/permissions/action/${action}/`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }).catch((err) => {
+            console.error(`Error checking ${action} permission:`, err.response?.data || err.message);
+            return { data: { allowed: false } }; // Fallback to false
+          })
+        );
+
+        const permissionResponses = await Promise.all(permissionPromises);
+        const actionPerms = actions.reduce((acc, action, index) => {
+          acc[action] = permissionResponses[index].data.allowed || false;
+          return acc;
+        }, {});
+
+        console.log('Permissions fetched:', actionPerms);
+        setPermissions(actionPerms);
+
+        // Fetch data only if page permission is granted
+        await Promise.all([fetchPurchaseOrders(), fetchApprovedRequisitions(), fetchVendors(), fetchInventoryItems()]);
+      } catch (err) {
+        console.error('Error checking permissions:', err.response?.data || err.message);
+        setAlert(`⚠️ Failed to check permissions: ${err.response?.data?.detail || err.message}`);
+        setHasPermission(false);
+      } finally {
+        setCheckingPermissions(false);
+      }
+    };
+
+    checkPermissions();
+  }, [fetchPurchaseOrders, fetchApprovedRequisitions, fetchVendors, fetchInventoryItems]);
+
+  // Handle search and pagination
+  useEffect(() => {
+    if (hasPermission && (search !== prevSearchRef.current || searchTerm !== prevSearchTermRef.current)) {
+      setPage(1);
+      prevSearchRef.current = search;
+      prevSearchTermRef.current = searchTerm;
+    }
+    if (hasPermission) fetchPurchaseOrders();
+  }, [search, searchTerm, page, hasPermission, fetchPurchaseOrders]);
+
+  // Handle form input changes
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({
+      ...prev,
+      [name]: value,
+    }));
+  };
+
+  // Handle requisition selection
+  const handleRequisitionChange = (newValue) => {
+    setFormData((prev) => ({
+      ...prev,
+      requisition: newValue,
+      department: newValue ? newValue.department : '',
+      items: newValue
+        ? newValue.items.map((item) => ({
+            item: item.item?.id || null,
+            quantity: item.quantity || 0,
+            unit_price: item.unit_cost || 0,
+            notes: item.notes || '',
+          }))
+        : [],
+    }));
+    setModalAlert(null);
+  };
+
+  // Handle vendor selection
+  const handleVendorChange = (newValue) => {
+    setFormData((prev) => ({
+      ...prev,
+      vendor: newValue,
+    }));
+  };
+
+  // Handle new item input changes
+  const handleNewItemChange = (field, value) => {
+    setNewItem((prev) => ({
+      ...prev,
+      [field]: value,
+    }));
+  };
+
+  // Add new item to PO
+  const handleAddItem = () => {
+    if (!newItem.item || !newItem.quantity || !newItem.unit_price) {
+      setModalAlert('⚠️ Please fill all required fields for the item (Item, Quantity, Unit Price).');
+      console.log('Missing fields:', { item: newItem.item, quantity: newItem.quantity, unit_price: newItem.unit_price });
+      return;
+    }
+
+    const quantity = parseInt(newItem.quantity, 10);
+    const unitPrice = parseFloat(newItem.unit_price);
+
+    if (isNaN(quantity) || quantity <= 0) {
+      setModalAlert('⚠️ Quantity must be a positive number.');
+      return;
+    }
+
+    if (isNaN(unitPrice) || unitPrice <= 0) {
+      setModalAlert('⚠️ Unit price must be a positive number.');
+      return;
+    }
+
+    const newItemObj = {
+      item: newItem.item.id,
+      quantity,
+      unit_price: unitPrice,
+      notes: newItem.notes || '',
+    };
+
+    console.log('Adding item:', newItemObj);
+
+    setFormData((prev) => ({
+      ...prev,
+      items: [...prev.items, newItemObj],
+    }));
+
+    setNewItem({
+      item: null,
+      quantity: '',
+      unit_price: '',
+      notes: '',
+    });
+    setModalAlert(null);
+  };
+
+  // Remove item from PO
+  const handleRemoveItem = (index) => {
+    setFormData((prev) => ({
+      ...prev,
+      items: prev.items.filter((_, i) => i !== index),
+    }));
+  };
+
+  // Open modal for creating new PO
+  const handleOpenCreateModal = async () => {
+    setLoading(true);
+    try {
+      console.log('Checking create_purchase_order permission...');
+      const response = await API.get('/auth/permissions/action/create_purchase_order/', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      console.log('Create permission response:', response.data);
+      if (!response.data.allowed) {
+        setAlert('⚠️ You do not have permission to create purchase orders.');
+        return;
+      }
+
+      setModalMode('create');
+      setFormData({
+        requisition: null,
+        vendor: null,
+        department: '',
+        delivery_address: '',
+        expected_delivery_date: '',
+        payment_terms: '',
+        notes: '',
+        items: [],
+      });
+      setNewItem({
+        item: null,
+        quantity: '',
+        unit_price: '',
+        notes: '',
+      });
+      setModalAlert(null);
+      setOpenModal(true);
+    } catch (err) {
+      console.error('Create permission error:', err.response?.data || err.message);
+      setAlert(`⚠️ Failed to check create permission: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Open modal for editing PO
+  const handleOpenEditModal = async (po) => {
+    setLoading(true);
+    try {
+      const response = await API.get('/auth/permissions/action/update_purchase_order/', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      if (!response.data.allowed) {
+        setAlert('⚠️ You do not have permission to edit purchase orders.');
+        return;
+      }
+
+      if (po.status !== 'draft') {
+        setAlert('⚠️ Only draft purchase orders can be edited.');
+        return;
+      }
+
+      setModalMode('edit');
+      setSelectedPO(po);
+      setFormData({
+        requisition: po.requisition || null,
+        vendor: po.vendor || null,
+        department: po.department || '',
+        delivery_address: po.delivery_address || '',
+        expected_delivery_date: po.expected_delivery_date || '',
+        payment_terms: po.payment_terms || '',
+        notes: po.notes || '',
+        items: po.items?.map((item) => ({
+          item: item.item?.id || null,
+          quantity: item.quantity || 0,
+          unit_price: item.unit_price || 0,
+          notes: item.notes || '',
+        })) || [],
+      });
+      setNewItem({
+        item: null,
+        quantity: '',
+        unit_price: '',
+        notes: '',
+      });
+      setModalAlert(null);
+      setOpenModal(true);
+    } catch (err) {
+      console.error('Edit permission error:', err.response?.data || err.message);
+      setAlert(`⚠️ Failed to check edit permission: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Open delete dialog
+  const handleOpenDeleteDialog = async (id) => {
+    setLoading(true);
+    try {
+      const response = await API.get('/auth/permissions/action/delete_purchase_order/', {
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      if (!response.data.allowed) {
+        setAlert('⚠️ You do not have permission to delete purchase orders.');
+        return;
+      }
+      const po = purchaseOrders.find((p) => p.id === id);
+      if (po.status !== 'draft') {
+        setAlert('⚠️ Only draft purchase orders can be deleted.');
+        return;
+      }
+      setDeleteId(id);
+      setOpenDeleteDialog(true);
+    } catch (err) {
+      console.error('Delete permission error:', err.response?.data || err.message);
+      setAlert(`⚠️ Failed to check delete permission: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Close delete dialog
+  const handleCloseDeleteDialog = () => {
+    setOpenDeleteDialog(false);
+    setDeleteId(null);
+    setAlert(null);
+    setModalAlert(null);
+  };
+
+  // Delete PO
+  const handleDelete = async () => {
+    setLoading(true);
+    try {
+      setAlert(null);
+      await API.delete(`procurement/purchase-orders/${deleteId}/`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+      });
+      setAlert('✅ Purchase order deleted successfully!');
+      fetchPurchaseOrders();
+      handleCloseDeleteDialog();
+    } catch (err) {
+      console.error('Delete error:', err.response?.data || err.message);
+      let errorMsg = '❌ Failed to delete purchase order.';
+      if (err.response?.data) {
+        errorMsg = err.response.data.detail || JSON.stringify(err.response.data);
+      } else {
+        errorMsg = err.message || '❌ Network error.';
+      }
+      setAlert(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Submit PO (create or update)
+  const handleSubmit = async () => {
+    // Validate required fields
+    if (!formData.vendor || !formData.department || !formData.delivery_address || !formData.expected_delivery_date || formData.items.length === 0) {
+      setModalAlert('⚠️ Please fill all required fields and add at least one item.');
+      return;
+    }
+
+    // Validate items
+    const invalidItems = formData.items.filter((item) => !item.item || isNaN(item.quantity) || item.quantity <= 0 || isNaN(item.unit_price) || item.unit_price <= 0);
+    if (invalidItems.length > 0) {
+      setModalAlert('⚠️ All items must have a valid item, positive quantity, and positive unit price.');
+      console.log('Invalid items:', invalidItems);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setModalAlert(null);
+
+      const payload = {
+        vendor: formData.vendor.id,
+        department: formData.department,
+        delivery_address: formData.delivery_address,
+        expected_delivery_date: formData.expected_delivery_date,
+        payment_terms: formData.payment_terms || '',
+        notes: formData.notes || '',
+        items: formData.items.map((item) => ({
+          item: item.item, // Ensure this is the item ID
+          quantity: parseInt(item.quantity, 10),
+          unit_price: parseFloat(item.unit_price),
+          notes: item.notes || '',
+        })),
+      };
+
+      if (formData.requisition) {
+        payload.requisition = formData.requisition.id;
+      }
+
+      console.log('Submitting payload:', JSON.stringify(payload, null, 2));
+
+      let response;
+      if (modalMode === 'create') {
+        response = await API.post('procurement/purchase-orders/', payload, {
+          headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+        });
+        setPurchaseOrders([response.data, ...purchaseOrders]);
+        setAlert('✅ Purchase order created successfully!');
+      } else {
+        response = await API.patch(`procurement/purchase-orders/${selectedPO.id}/`, payload, {
+          headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+        });
+        setPurchaseOrders(purchaseOrders.map((po) => (po.id === selectedPO.id ? response.data : po)));
+        setAlert('✅ Purchase order updated successfully!');
+      }
+
+      setOpenModal(false);
+      fetchPurchaseOrders();
+    } catch (err) {
+      console.error('Submit error:', err.response?.data || err.message);
+      let errorMsg = '❌ Failed to save purchase order.';
+      if (err.response?.data) {
+        const errors = err.response.data;
+        if (typeof errors === 'object') {
+          errorMsg = Object.entries(errors)
+            .map(([field, msg]) => {
+              if (field === 'items' && Array.isArray(msg)) {
+                return msg.map((itemError, index) => `Item ${index + 1}: ${JSON.stringify(itemError)}`).join('; ');
+              }
+              return `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`;
+            })
+            .join('; ');
+        } else {
+          errorMsg = errors.detail || errorMsg;
+        }
+      } else {
+        errorMsg = err.message || '❌ Network error.';
+      }
+      setModalAlert(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Submit PO for approval
+  const handleSubmitForApproval = async (poId) => {
+    setLoading(true);
+    try {
+      setAlert(null);
+      await API.patch(
+        `procurement/purchase-orders/${poId}/`,
+        { status: 'submitted' },
+        {
+          headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+        }
+      );
+      setAlert('✅ Purchase order submitted for approval!');
+      fetchPurchaseOrders();
+    } catch (err) {
+      console.error('Submit for approval error:', err.response?.data || err.message);
+      let errorMsg = '❌ Failed to submit purchase order.';
+      if (err.response?.data) {
+        errorMsg = err.response.data.detail || JSON.stringify(err.response.data);
+      } else {
+        errorMsg = err.message || '❌ Network error.';
+      }
+      setAlert(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Approve PO
+  const handleApprovePO = async (poId) => {
+    setLoading(true);
+    try {
+      setAlert(null);
+      await API.post(
+        `procurement/purchase-orders/${poId}/approve/`,
+        {},
+        {
+          headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+        }
+      );
+      setAlert('✅ Purchase order approved successfully!');
+      fetchPurchaseOrders();
+    } catch (err) {
+      console.error('Approve error:', err.response?.data || err.message);
+      let errorMsg = '❌ Failed to approve purchase order.';
+      if (err.response?.data) {
+        errorMsg = err.response.data.detail || JSON.stringify(err.response.data);
+      } else {
+        errorMsg = err.message || '❌ Network error.';
+      }
+      setAlert(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Reject PO
+  const handleRejectPO = async (poId) => {
+    setLoading(true);
+    try {
+      setAlert(null);
+      await API.post(
+        `procurement/purchase-orders/${poId}/reject/`,
+        {},
+        {
+          headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+        }
+      );
+      setAlert('✅ Purchase order rejected successfully!');
+      fetchPurchaseOrders();
+    } catch (err) {
+      console.error('Reject error:', err.response?.data || err.message);
+      let errorMsg = '❌ Failed to reject purchase order.';
+      if (err.response?.data) {
+        errorMsg = err.response.data.detail || JSON.stringify(err.response.data);
+      } else {
+        errorMsg = err.message || '❌ Network error.';
+      }
+      setAlert(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Export PO as PDF
+  const handleExportPDF = async (poId) => {
+    setLoading(true);
+    try {
+      setAlert(null);
+      const response = await API.get(`procurement/purchase-orders/${poId}/export_pdf/`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('accessToken')}` },
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `PO_${poId}.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setAlert('✅ Purchase order PDF exported successfully!');
+    } catch (err) {
+      console.error('Export PDF error:', err.response?.data || err.message);
+      let errorMsg = '❌ Failed to export purchase order as PDF.';
+      if (err.response?.data) {
+        errorMsg = err.response.data.detail || JSON.stringify(err.response.data);
+      } else {
+        errorMsg = err.message || '❌ Network error.';
+      }
+      setAlert(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (checkingPermissions) {
+    return (
+      <Container>
+        <Typography variant="h6" sx={{ mt: 4 }}>
+          Loading permissions...
+        </Typography>
+        <CircularProgress sx={{ mt: 2 }} />
+      </Container>
+    );
+  }
+
+  if (!hasPermission) {
+    return (
+      <Container>
+        <Alert severity="error" sx={{ mt: 4 }} onClose={() => setAlert(null)}>
+          {alert || '⚠️ You do not have permission to view this page.'}
+        </Alert>
+      </Container>
+    );
+  }
+
+  return (
+    <Container maxWidth="lg">
+      {alert && !openModal && !openDeleteDialog && (
+        <Alert
+          sx={{ mt: 2, mb: 2 }}
+          severity={alert.includes('❌') ? 'error' : alert.includes('⚠') ? 'warning' : 'success'}
+          onClose={() => setAlert(null)}
+        >
+          {alert}
+        </Alert>
+      )}
+
+      <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+          <Typography variant="h5">Purchase Orders Management</Typography>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={handleOpenCreateModal}
+            disabled={loading || !permissions.create_purchase_order}
+          >
+            Create Purchase Order
+          </Button>
+        </Box>
+
+        {/* Tutorial Section */}
+        <Card variant="outlined" sx={{ mb: 4, borderColor: 'primary.main', bgcolor: 'background.paper' }}>
+          <CardHeader
+            title={
+              <Box display="flex" alignItems="center" gap={1}>
+                <InfoIcon color="primary" />
+                <Typography variant="h6" color="primary">
+                  Page 2 of 4: Purchase Orders Management
+                </Typography>
+              </Box>
+            }
+            action={<IconButton onClick={() => setShowTutorial(!showTutorial)}>{showTutorial ? <ExpandLessIcon /> : <ExpandMoreIcon />}</IconButton>}
+          />
+          <Collapse in={showTutorial}>
+            <CardContent>
+              <Typography paragraph>
+                This page allows Procurement Officers to create formal purchase orders based on approved requisitions. Purchase Orders (POs) are legally binding documents sent to vendors to order goods or services.
+              </Typography>
+              <Typography variant="subtitle1" gutterBottom>
+                Key Features:
+              </Typography>
+              <ul>
+                <li>
+                  <strong>Create PO from Requisition:</strong> Select an approved requisition to auto-populate department and items
+                </li>
+                <li>
+                  <strong>Standalone PO:</strong> Create a PO without a requisition for ad-hoc purchases
+                </li>
+                <li>
+                  <strong>Vendor Selection:</strong> Choose from your approved vendor list
+                </li>
+                <li>
+                  <strong>Delivery Details:</strong> Set delivery address and expected date
+                </li>
+                <li>
+                  <strong>PO Status Tracking:</strong> Monitor PO progress from Draft → Submitted → Approved → Received
+                </li>
+                <li>
+                  <strong>Approval Workflow:</strong> Managers can approve or reject submitted POs
+                </li>
+                <li>
+                  <strong>PDF Export:</strong> Generate professional PDF documents for vendors
+                </li>
+              </ul>
+              <Typography variant="subtitle1" gutterBottom>
+                Workflow:
+              </Typography>
+              <ol>
+                <li>Create a PO (from requisition or standalone)</li>
+                <li>Submit for approval (changes status to "Submitted")</li>
+                <li>Approvers review and either approve or reject</li>
+                <li>Approved POs are sent to vendors</li>
+                <li>When goods arrive, create a Receiving record (Page 3)</li>
+              </ol>
+              <Typography variant="subtitle1" gutterBottom>
+                Important Notes:
+              </Typography>
+              <ul>
+                <li>Only Draft POs can be edited or deleted</li>
+                <li>Submitted POs require approval before processing</li>
+                <li>All fields marked with * are required</li>
+                <li>Total amount is automatically calculated from line items in Naira</li>
+              </ul>
+            </CardContent>
+          </Collapse>
+        </Card>
+
+        <Grid container spacing={2} mb={3}>
+          <Grid item xs={12} md={6}>
+            <Typography variant="body1" color="text.secondary">
+              Create and manage purchase orders for your organization. Convert approved requisitions into formal orders or create standalone orders.
+            </Typography>
+          </Grid>
+          <Grid item xs={12} md={6} display="flex" justifyContent="flex-end">
+            <TextField
+              size="small"
+              placeholder="Search purchase orders..."
+              value={search}
+              onChange={(e) => debouncedSetSearch(e.target.value)}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon />
+                  </InputAdornment>
+                ),
+              }}
+            />
+          </Grid>
+        </Grid>
+
+        <Divider sx={{ my: 3 }} />
+
+        <Typography variant="h6" gutterBottom>Purchase Orders</Typography>
+
+        {purchaseOrders.length > 0 ? (
+          <>
+            <TableContainer>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell></TableCell>
+                    <TableCell>PO Code</TableCell>
+                    <TableCell>Vendor</TableCell>
+                    <TableCell>Department</TableCell>
+                    <TableCell>Status</TableCell>
+                    <TableCell>Total Amount</TableCell>
+                    <TableCell>Created</TableCell>
+                    <TableCell>Actions</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {purchaseOrders.map((po) => (
+                    <PurchaseOrderRow
+                      key={po.id}
+                      po={po}
+                      onEdit={handleOpenEditModal}
+                      onDelete={handleOpenDeleteDialog}
+                      onSubmitForApproval={handleSubmitForApproval}
+                      onApprove={handleApprovePO}
+                      onReject={handleRejectPO}
+                      onExportPDF={handleExportPDF}
+                      permissions={permissions}
+                      loading={loading}
+                      formatCurrency={formatCurrency}
+                    />
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            {totalPages > 1 && (
+              <Box mt={3} display="flex" justifyContent="center">
+                <Pagination count={totalPages} page={page} onChange={(_, value) => setPage(value)} color="primary" />
+              </Box>
+            )}
+          </>
+        ) : (
+          <Box textAlign="center" py={4}>
+            <Typography variant="body1" color="text.secondary">
+              No purchase orders found.
+            </Typography>
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              onClick={handleOpenCreateModal}
+              sx={{ mt: 2 }}
+              disabled={loading || !permissions.create_purchase_order}
+            >
+              Create Your First Purchase Order
+            </Button>
+          </Box>
+        )}
+      </Paper>
+
+      {/* Purchase Order Modal */}
+      <Dialog open={openModal} onClose={() => setOpenModal(false)} fullWidth maxWidth="md" PaperProps={{ sx: { minHeight: '80vh' } }}>
+        <DialogTitle>
+          <Box display="flex" justifyContent="space-between" alignItems="center">
+            {modalMode === 'create' ? 'Create New Purchase Order' : 'Edit Purchase Order'}
+            <IconButton onClick={() => setOpenModal(false)}>
+              <CloseIcon />
+            </IconButton>
+          </Box>
+        </DialogTitle>
+
+        <DialogContent dividers>
+          {modalAlert && (
+            <Alert
+              sx={{ mb: 2 }}
+              severity={modalAlert.includes('❌') ? 'error' : modalAlert.includes('⚠') ? 'warning' : 'success'}
+              onClose={() => setModalAlert(null)}
+            >
+              {modalAlert}
+            </Alert>
+          )}
+          <Grid container spacing={3}>
+            <Grid item xs={12}>
+              <Autocomplete
+                options={requisitions}
+                getOptionLabel={(option) => `${option.code} - ${option.department}`}
+                value={formData.requisition}
+                onChange={(event, newValue) => handleRequisitionChange(newValue)}
+                renderInput={(params) => <TextField {...params} label="Select Approved Requisition (Optional)" />}
+                isOptionEqualToValue={(option, value) => option.id === value?.id}
+              />
+              <Typography variant="caption" color="text.secondary" display="block" mt={1}>
+                Select an approved requisition to auto-populate department and items
+              </Typography>
+            </Grid>
+
+            <Grid item xs={12}>
+              <Autocomplete
+                required
+                options={vendors}
+                getOptionLabel={(option) => option.name}
+                value={formData.vendor}
+                onChange={(event, newValue) => handleVendorChange(newValue)}
+                renderInput={(params) => <TextField {...params} label="Vendor *" required />}
+                isOptionEqualToValue={(option, value) => option.id === value?.id}
+              />
+            </Grid>
+
+            <Grid item xs={12} md={6}>
+              <TextField
+                required
+                label="Department *"
+                name="department"
+                value={formData.department}
+                onChange={handleInputChange}
+                fullWidth
+                select
+              >
+                <MenuItem value="IT">IT</MenuItem>
+                <MenuItem value="HR">Human Resources</MenuItem>
+                <MenuItem value="Finance">Finance</MenuItem>
+                <MenuItem value="Marketing">Marketing</MenuItem>
+                <MenuItem value="Operations">Operations</MenuItem>
+                <MenuItem value="Sales">Sales</MenuItem>
+                <MenuItem value="R&D">Research & Development</MenuItem>
+                <MenuItem value="Procurement">Procurement</MenuItem>
+                <MenuItem value="Admin">Administration</MenuItem>
+              </TextField>
+            </Grid>
+
+            <Grid item xs={12} md={6}>
+              <TextField
+                required
+                label="Expected Delivery Date *"
+                type="date"
+                name="expected_delivery_date"
+                value={formData.expected_delivery_date}
+                onChange={handleInputChange}
+                fullWidth
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+
+            <Grid item xs={12}>
+              <TextField
+                required
+                label="Delivery Address *"
+                name="delivery_address"
+                value={formData.delivery_address}
+                onChange={handleInputChange}
+                fullWidth
+                multiline
+                minRows={2}
+                placeholder="Enter full delivery address..."
+              />
+            </Grid>
+
+            <Grid item xs={12} md={6}>
+              <TextField
+                label="Payment Terms"
+                name="payment_terms"
+                value={formData.payment_terms}
+                onChange={handleInputChange}
+                fullWidth
+                multiline
+                minRows={2}
+                placeholder="e.g., Net 30, 50% upfront, etc."
+              />
+            </Grid>
+
+            <Grid item xs={12} md={6}>
+              <TextField
+                label="Notes"
+                name="notes"
+                value={formData.notes}
+                onChange={handleInputChange}
+                fullWidth
+                multiline
+                minRows={2}
+                placeholder="Additional notes or instructions..."
+              />
+            </Grid>
+
+            <Grid item xs={12}>
+              <Typography variant="h6" gutterBottom>
+                Items
+              </Typography>
+
+              <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+                <Grid container spacing={2}>
+                  <Grid item xs={12} md={4}>
+                    <Autocomplete
+                      options={inventoryItems}
+                      getOptionLabel={(option) => option.name}
+                      value={newItem.item}
+                      onChange={(event, newValue) => handleNewItemChange('item', newValue)}
+                      renderInput={(params) => <TextField {...params} label="Select Item *" required />}
+                      isOptionEqualToValue={(option, value) => option.id === value?.id}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} md={2}>
+                    <TextField
+                      required
+                      label="Quantity *"
+                      type="number"
+                      value={newItem.quantity}
+                      onChange={(e) => handleNewItemChange('quantity', e.target.value)}
+                      fullWidth
+                      inputProps={{ min: 1 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} md={2}>
+                    <TextField
+                      required
+                      label="Unit Price (₦)*"
+                      type="number"
+                      value={newItem.unit_price}
+                      onChange={(e) => handleNewItemChange('unit_price', e.target.value)}
+                      fullWidth
+                      inputProps={{ min: 0.01, step: 0.01 }}
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} md={3}>
+                    <TextField
+                      label="Notes"
+                      value={newItem.notes}
+                      onChange={(e) => handleNewItemChange('notes', e.target.value)}
+                      fullWidth
+                    />
+                  </Grid>
+
+                  <Grid item xs={12} md={1} display="flex" alignItems="flex-end">
+                    <Button variant="contained" onClick={handleAddItem} fullWidth disabled={loading}>
+                      Add
+                    </Button>
+                  </Grid>
+                </Grid>
+              </Paper>
+
+              {formData.items.length > 0 ? (
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Item</TableCell>
+                        <TableCell>Quantity</TableCell>
+                        <TableCell>Unit Price</TableCell>
+                        <TableCell>Total</TableCell>
+                        <TableCell>Notes</TableCell>
+                        <TableCell>Actions</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {formData.items.map((item, index) => {
+                        const inventoryItem = inventoryItems.find((i) => i.id === item.item);
+                        const total = item.quantity * item.unit_price;
+
+                        return (
+                          <TableRow key={index}>
+                            <TableCell>{inventoryItem ? inventoryItem.name : 'Unknown Item'}</TableCell>
+                            <TableCell>{item.quantity}</TableCell>
+                            <TableCell>{formatCurrency(item.unit_price)}</TableCell>
+                            <TableCell>{formatCurrency(total)}</TableCell>
+                            <TableCell>{item.notes || '-'}</TableCell>
+                            <TableCell>
+                              <IconButton size="small" onClick={() => handleRemoveItem(index)} color="error">
+                                <CancelIcon />
+                              </IconButton>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              ) : (
+                <Typography color="text.secondary" textAlign="center" py={2}>
+                  No items added yet. Add items using the form above.
+                </Typography>
+              )}
+
+              {formData.items.length > 0 && (
+                <Box mt={2} display="flex" justifyContent="flex-end">
+                  <Typography variant="h6">Total Amount: {formatCurrency(calculateTotalAmount(formData.items))}</Typography>
+                </Box>
+              )}
+            </Grid>
+          </Grid>
+        </DialogContent>
+
+        <DialogActions sx={{ p: 3 }}>
+          <Button onClick={() => setOpenModal(false)} disabled={loading}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleSubmit}
+            disabled={loading || formData.items.length === 0 || !formData.vendor || !formData.department || !formData.delivery_address || !formData.expected_delivery_date}
+            startIcon={loading ? <CircularProgress size={20} /> : null}
+          >
+            {loading ? 'Saving...' : modalMode === 'create' ? 'Create Purchase Order' : 'Update Purchase Order'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={openDeleteDialog} onClose={handleCloseDeleteDialog}>
+        <DialogTitle>Delete Purchase Order?</DialogTitle>
+        <DialogContent>
+          {alert && (
+            <Alert
+              sx={{ mb: 2 }}
+              severity={alert.includes('❌') ? 'error' : alert.includes('⚠') ? 'warning' : 'success'}
+              onClose={() => setAlert(null)}
+            >
+              {alert}
+            </Alert>
+          )}
+          <Typography>Are you sure you want to delete this purchase order? This cannot be undone.</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseDeleteDialog} disabled={loading}>
+            Cancel
+          </Button>
+          <Button color="error" onClick={handleDelete} disabled={loading}>
+            {loading ? 'Deleting...' : 'Delete'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Container>
+  );
+}

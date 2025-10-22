@@ -1,0 +1,3232 @@
+ models.py:
+from django.db import models
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+from alerts.models import Alert
+import logging
+from decimal import Decimal
+import uuid
+
+logger = logging.getLogger(__name__)
+
+CURRENCY_CHOICES = [
+    ('NGN', 'Nigerian Naira'),
+    ('USD', 'US Dollar'),
+]
+
+NOTIFICATION_TYPES = [
+    ('OVERDUE', 'Overdue Rental'),
+    ('ALMOST_OVERDUE', 'Almost Overdue Rental'),
+    ('UNPAID', 'Unpaid Rental'),
+]
+
+SEVERITY_LEVELS = [
+    ('INFO', 'Info'),
+    ('WARNING', 'Warning'),
+    ('CRITICAL', 'Critical'),
+]
+
+def rental_image_upload_path(instance, filename):
+    return f'rentals/equipment_{instance.id}/{filename}'
+
+class Notification(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notifications')
+    type = models.CharField(max_length=50, choices=NOTIFICATION_TYPES)
+    severity = models.CharField(max_length=20, choices=SEVERITY_LEVELS, default='INFO')
+    title = models.CharField(max_length=255)
+    message = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    related_rental = models.ForeignKey('Rental', on_delete=models.CASCADE, null=True, blank=True)
+    related_equipment = models.ForeignKey('Equipment', on_delete=models.CASCADE, null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email} - {self.title}"
+
+class Branch(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    code = models.CharField(max_length=20, unique=True)
+    address = models.TextField()
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_branches'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+    def delete(self, *args, **kwargs):
+        if self.equipment.exists():
+            raise ValidationError("Cannot delete branch with assigned equipment.")
+        super().delete(*args, **kwargs)
+
+    class Meta:
+        ordering = ['name']
+
+class Equipment(models.Model):
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    image = models.ImageField(upload_to=rental_image_upload_path, blank=True, null=True)
+    manufacture_date = models.DateField(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    category = models.CharField(max_length=100)
+    condition = models.CharField(max_length=50)
+    location = models.CharField(max_length=100)
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='equipment', null=True, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='equipment')
+    created_at = models.DateTimeField(auto_now_add=True)
+    total_quantity = models.PositiveIntegerField(default=1)
+    available_quantity = models.PositiveIntegerField(default=1)
+
+    def clean(self):
+        if self.available_quantity > self.total_quantity:
+            raise ValidationError("Available quantity cannot exceed total quantity.")
+        if self.available_quantity < 0:
+            raise ValidationError("Available quantity cannot be negative.")
+        if self.branch is None:
+            return
+        required_fields = ['name', 'category', 'condition', 'location']
+        for field in required_fields:
+            if not getattr(self, field):
+                raise ValidationError({field: "This field cannot be blank."})
+
+    def save(self, *args, **kwargs):
+        is_new = not self.pk
+        if is_new:
+            self.available_quantity = self.total_quantity
+            self.full_clean()
+            super().save(*args, **kwargs)
+        else:
+            reserved_quantity = self.reservations.filter(
+                is_active=True,
+                end_date__gte=timezone.now().date()
+            ).aggregate(models.Sum('quantity'))['quantity__sum'] or 0
+            rented_quantity = self.rentals.filter(returned=False).aggregate(models.Sum('quantity'))['quantity__sum'] or 0
+            self.available_quantity = max(0, self.total_quantity - reserved_quantity - rented_quantity)
+            self.full_clean()
+            super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+class Reservation(models.Model):
+    equipment = models.ForeignKey(Equipment, on_delete=models.CASCADE, related_name='reservations')
+    reserved_for = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reservations_made', null=True, blank=True)
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)
+    quantity = models.PositiveIntegerField(default=1)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='reservations_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"Reservation for {self.equipment.name} by {self.reserved_for.email if self.reserved_for else 'N/A'}"
+
+    def clean(self):
+        if self.end_date and self.start_date > self.end_date:
+            raise ValidationError("End date must be after start date.")
+        if self.quantity <= 0:
+            raise ValidationError("Reservation quantity must be positive.")
+        if self.reserved_for and not hasattr(self.reserved_for, 'get_full_name'):
+            logger.error(f"Invalid reserved_for value: {self.reserved_for} (type: {type(self.reserved_for)})")
+            raise ValidationError(f"Invalid reserved_for user: {self.reserved_for}")
+        if self.pk:
+            available = self.equipment.total_quantity - self.equipment.rentals.filter(returned=False).aggregate(
+                models.Sum('quantity'))['quantity__sum'] or 0
+            if self.quantity > available:
+                raise ValidationError(f"Only {available} units available for reservation.")
+
+    def save(self, *args, **kwargs):
+        if self.end_date and self.end_date < timezone.now().date():
+            self.is_active = False
+        self.full_clean()
+        super().save(*args, **kwargs)
+        self.equipment.save()
+
+class Rental(models.Model):
+    code = models.CharField(max_length=20, unique=True, default=uuid.uuid4().hex[:8])
+    renter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='rentals')
+    equipment = models.ForeignKey(Equipment, on_delete=models.CASCADE, related_name='rentals')
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='rentals', null=True, blank=True)
+    start_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    extended_to = models.DateField(null=True, blank=True)
+    rental_rate = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='NGN')
+    quantity = models.PositiveIntegerField(default=1)
+    returned = models.BooleanField(default=False)
+    returned_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='created_rentals')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        if self.renter is None:
+            raise ValidationError("Renter cannot be null.")
+        if not hasattr(self.renter, 'get_full_name'):
+            logger.error(f"Invalid renter value: {self.renter} (type: {type(self.renter)})")
+            raise ValidationError(f"Invalid renter: must be a valid User instance, got {self.renter}.")
+        if self.created_by and not hasattr(self.created_by, 'get_full_name'):
+            logger.error(f"Invalid created_by value: {self.created_by} (type: {type(self.created_by)})")
+            raise ValidationError(f"Invalid created_by: must be a valid User instance, got {self.created_by}.")
+        if self.quantity <= 0:
+            raise ValidationError("Quantity must be positive.")
+        if self.due_date and self.start_date > self.due_date:
+            raise ValidationError("Due date must be after start date.")
+
+    @property
+    def effective_due_date(self):
+        return self.extended_to or self.due_date
+
+    @property
+    def is_open_ended(self):
+        return self.due_date is None and self.extended_to is None
+
+    @property
+    def is_overdue(self):
+        if self.returned or self.is_open_ended:
+            return False
+        due = self.effective_due_date
+        return due and due < timezone.now().date()
+
+    @property
+    def days_overdue(self):
+        if self.is_overdue:
+            return (timezone.now().date() - self.effective_due_date).days
+        return 0
+
+    @property
+    def duration_days(self):
+        if not self.start_date:
+            return 0
+        if self.returned and self.returned_at:
+            end = self.returned_at.date()
+        elif self.is_open_ended:
+            end = timezone.now().date()
+        else:
+            end = self.effective_due_date or timezone.now().date()
+        return max(1, (end - self.start_date).days)
+
+    @property
+    def total_rental_cost(self):
+        if not self.rental_rate or self.rental_rate <= 0:
+            return Decimal('0.00')
+        days = self.duration_days
+        return Decimal(str(self.rental_rate * days * self.quantity)).quantize(Decimal('0.01'))
+
+    @property
+    def total_paid(self):
+        return self.payments.filter(status='Paid').aggregate(
+            total=models.Sum('amount_paid')
+        )['total'] or Decimal('0.00')
+
+    @property
+    def balance_due(self):
+        return max(self.total_rental_cost - self.total_paid, Decimal('0.00'))
+
+    def save(self, *args, **kwargs):
+        is_new = not self.pk
+        is_return_update = False
+        if not is_new:
+            old = Rental.objects.get(pk=self.pk)
+            is_return_update = (not old.returned) and self.returned
+
+        self.full_clean()
+
+        if is_new:
+            reserved_quantity = self.equipment.reservations.filter(
+                is_active=True,
+                start_date__lte=self.start_date,
+                end_date__gte=self.start_date
+            ).aggregate(models.Sum('quantity'))['quantity__sum'] or 0
+            rented_quantity = self.equipment.rentals.filter(returned=False).aggregate(
+                models.Sum('quantity'))['quantity__sum'] or 0
+            available = self.equipment.total_quantity - reserved_quantity - rented_quantity
+            if self.quantity > available:
+                raise ValidationError(f"Only {available} units available for rental.")
+
+            self.branch = self.equipment.branch
+            super().save(*args, **kwargs)
+            self.code = f"RENT-{self.id:06d}"
+            super().save(update_fields=['code', 'branch'])
+            self.equipment.available_quantity -= self.quantity
+            self.equipment.save(update_fields=['available_quantity'])
+
+        elif is_return_update:
+            self.equipment.available_quantity = min(
+                self.equipment.available_quantity + self.quantity,
+                self.equipment.total_quantity
+            )
+            self.equipment.save(update_fields=['available_quantity'])
+            if not self.returned_at:
+                self.returned_at = timezone.now()
+            super().save(*args, **kwargs)
+
+        else:
+            super().save(*args, **kwargs)
+
+        self._check_overdue_alert()
+        self.check_notifications()
+
+    def _check_overdue_alert(self):
+        if self.is_overdue and not self.returned:
+            existing = Alert.objects.filter(
+                user=self.renter,
+                message__contains=self.code,
+                type='Tracker Issue',
+            ).exists()
+            if not existing:
+                try:
+                    Alert.objects.create(
+                        user=self.renter,
+                        type='Tracker Issue',
+                        message=f"Rental {self.code} for {self.equipment.name} is overdue by {self.days_overdue} days.",
+                    )
+                    logger.warning(f"Overdue rental alert created for {self.code}")
+                except Exception as e:
+                    logger.error(f"Failed to create overdue alert for {self.code}: {e}")
+
+    def check_notifications(self):
+        if self.returned:
+            return
+        today = timezone.now().date()
+        due = self.effective_due_date
+        if not due:
+            return
+        days_until_due = (due - today).days
+        if days_until_due < 0 and self.balance_due > 0:
+            Notification.objects.get_or_create(
+                user=self.renter,
+                type='OVERDUE',
+                related_rental=self,
+                defaults={
+                    'severity': 'CRITICAL',
+                    'title': 'Rental Overdue',
+                    'message': f"Rental {self.code} for {self.equipment.name} is overdue by {abs(days_until_due)} days with {self.currency} {self.balance_due} unpaid.",
+                }
+            )
+        elif 0 <= days_until_due <= 3:
+            Notification.objects.get_or_create(
+                user=self.renter,
+                type='ALMOST_OVERDUE',
+                related_rental=self,
+                defaults={
+                    'severity': 'WARNING',
+                    'title': 'Rental Due Soon',
+                    'message': f"Rental {self.code} for {self.equipment.name} is due in {days_until_due} days.",
+                }
+            )
+        if self.balance_due > 0:
+            Notification.objects.get_or_create(
+                user=self.renter,
+                type='UNPAID',
+                related_rental=self,
+                defaults={
+                    'severity': 'WARNING',
+                    'title': 'Unpaid Rental Balance',
+                    'message': f"Rental {self.code} for {self.equipment.name} has an unpaid balance of {self.currency} {self.balance_due}.",
+                }
+            )
+
+    def __str__(self):
+        return f"{self.code} - {self.renter.email if self.renter else 'N/A'} - {self.equipment.name} x{self.quantity}"
+
+class RentalPayment(models.Model):
+    rental = models.ForeignKey(Rental, on_delete=models.CASCADE, related_name='payments')
+    amount_paid = models.DecimalField(max_digits=10, decimal_places=2)
+    amount_in_words = models.CharField(max_length=255)
+    payment_date = models.DateField(auto_now_add=True)
+    status = models.CharField(max_length=20, choices=[('Paid', 'Paid'), ('Pending', 'Pending')], default='Paid')
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='rental_payments')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        if self.amount_paid <= 0:
+            raise ValidationError("Amount paid must be positive.")
+        if self.amount_paid > self.rental.balance_due:
+            raise ValidationError(f"Amount paid ({self.amount_paid}) exceeds balance due ({self.rental.balance_due}).")
+        if not self.amount_in_words:
+            raise ValidationError("Amount in words is required.")
+        if not hasattr(self.rental.renter, 'get_full_name'):
+            logger.error(f"Invalid renter in rental {self.rental.id}: {self.rental.renter} (type: {type(self.rental.renter)})")
+            raise ValidationError(f"Invalid renter in associated rental: {self.rental.renter}.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+        if self.status == 'Paid':
+            self.rental.check_notifications()
+
+    def __str__(self):
+        return f"{self.rental.code} - {self.amount_paid} ({self.status})"
+
+class RentalReceipt(models.Model):
+    rental = models.OneToOneField(Rental, on_delete=models.CASCADE, related_name='receipt')
+    generated_at = models.DateTimeField(auto_now_add=True)
+    generated_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+
+    def __str__(self):
+        return f"Receipt for {self.rental.code}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from rest_framework import serializers
+from .models import Equipment, Rental, RentalPayment, Branch, Reservation, Notification
+from django.contrib.auth import get_user_model
+from decimal import Decimal
+import logging
+from django.db import models
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
+class BranchSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Branch
+        fields = ['id', 'name', 'code', 'address', 'created_by', 'created_by_name', 'created_at']
+        read_only_fields = ['created_by', 'created_by_name', 'created_at']
+
+    def get_created_by_name(self, obj):
+        user = getattr(obj, 'created_by', None)
+        if user:
+            return getattr(user, 'full_name', None) or (user.get_full_name() if hasattr(user, 'get_full_name') else None) or user.email
+        return "N/A"
+
+class EquipmentSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Equipment
+        fields = [
+            'id', 'name', 'description', 'image', 'manufacture_date', 'expiry_date',
+            'category', 'condition', 'location', 'branch', 'branch_name',
+            'created_by', 'created_by_name', 'created_at',
+            'total_quantity', 'available_quantity'
+        ]
+        read_only_fields = ['created_by', 'created_by_name', 'created_at']
+
+    def get_image(self, obj):
+        if getattr(obj, 'image', None):
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            site = getattr(settings, 'SITE_URL', '')
+            return f"{site}{obj.image.url}"
+        return None
+
+    def get_created_by_name(self, obj):
+        user = getattr(obj, "created_by", None)
+        if user:
+            return getattr(user, 'full_name', None) or (user.get_full_name() if hasattr(user, 'get_full_name') else None) or user.email
+        return ""
+
+    def validate(self, data):
+        required = ['name', 'category', 'condition', 'location', 'branch']
+        for field in required:
+            if not data.get(field):
+                raise serializers.ValidationError(f"{field.replace('_', ' ').title()} is required.")
+        return data
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+class ReservationSerializer(serializers.ModelSerializer):
+    equipment_name = serializers.CharField(source='equipment.name', read_only=True)
+    reserved_for_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Reservation
+        fields = [
+            'id', 'equipment', 'equipment_name', 'reserved_for', 'reserved_for_name',
+            'start_date', 'end_date', 'quantity', 'is_active', 'created_by', 'created_by_name', 'created_at'
+        ]
+        read_only_fields = ['created_by', 'created_by_name', 'created_at', 'reserved_for_name', 'equipment_name']
+
+    def get_reserved_for_name(self, obj):
+        user = getattr(obj, 'reserved_for', None)
+        if user:
+            return getattr(user, 'full_name', None) or (user.get_full_name() if hasattr(user, 'get_full_name') else None) or user.email
+        return "N/A"
+
+    def get_created_by_name(self, obj):
+        user = getattr(obj, 'created_by', None)
+        if user:
+            return getattr(user, 'full_name', None) or (user.get_full_name() if hasattr(user, 'get_full_name') else None) or user.email
+        return "N/A"
+
+    def validate(self, data):
+        if data.get('end_date') and data['start_date'] > data['end_date']:
+            raise serializers.ValidationError("End date must be after start date.")
+        equipment = data.get('equipment', self.instance.equipment if self.instance else None)
+        quantity = data.get('quantity', self.instance.quantity if self.instance else 1)
+        reserved_sum = equipment.reservations.filter(is_active=True).aggregate(models.Sum('quantity'))['quantity__sum'] or 0 if equipment else 0
+        rented_sum = equipment.rentals.filter(returned=False).aggregate(models.Sum('quantity'))['quantity__sum'] or 0 if equipment else 0
+        available = (equipment.total_quantity if equipment else 0) - reserved_sum - rented_sum
+        if quantity > available:
+            raise serializers.ValidationError(f"Only {available} units available for reservation.")
+        return data
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+class RentalPaymentSerializer(serializers.ModelSerializer):
+    renter_name = serializers.SerializerMethodField()
+    equipment_name = serializers.CharField(source='rental.equipment.name', read_only=True)
+    currency = serializers.CharField(source='rental.currency', read_only=True)
+    total_rental_cost = serializers.DecimalField(source='rental.total_rental_cost', max_digits=12, decimal_places=2, read_only=True)
+    balance_due = serializers.DecimalField(source='rental.balance_due', max_digits=12, decimal_places=2, read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RentalPayment
+        fields = [
+            'id', 'rental', 'renter_name', 'equipment_name', 'amount_paid', 'amount_in_words',
+            'payment_date', 'status', 'created_by', 'created_by_name', 'currency',
+            'total_rental_cost', 'balance_due'
+        ]
+        read_only_fields = ['payment_date', 'created_by', 'created_at', 'created_by_name', 'currency', 'total_rental_cost', 'balance_due']
+
+    def get_renter_name(self, obj):
+        rental = getattr(obj, 'rental', None)
+        renter = getattr(rental, 'renter', None) if rental else None
+        if renter:
+            return getattr(renter, 'full_name', None) or (renter.get_full_name() if hasattr(renter, 'get_full_name') else None) or renter.email
+        logger.warning(f"Invalid renter for rental payment {obj.id}: {rental.renter if rental else None} (type: {type(rental.renter) if rental else None})")
+        return ""
+
+    def get_created_by_name(self, obj):
+        user = getattr(obj, 'created_by', None)
+        if user:
+            return getattr(user, 'full_name', None) or (user.get_full_name() if hasattr(user, 'get_full_name') else None) or user.email
+        return ""
+
+    def validate(self, data):
+        if data.get('amount_paid', 0) <= 0:
+            raise serializers.ValidationError({'amount_paid': 'Amount paid must be positive.'})
+        rental = data.get('rental', self.instance.rental if self.instance else None)
+        if rental and data.get('amount_paid') > getattr(rental, 'balance_due', 0):
+            raise serializers.ValidationError({
+                'amount_paid': f"Amount paid ({data['amount_paid']}) exceeds balance due ({rental.balance_due})."
+            })
+        if not data.get('amount_in_words'):
+            raise serializers.ValidationError({'amount_in_words': 'Amount in words is required.'})
+        return data
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+class RentalSerializer(serializers.ModelSerializer):
+    renter_name = serializers.SerializerMethodField()
+    equipment_name = serializers.CharField(source='equipment.name', read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    total_rental_cost = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_paid = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    is_overdue = serializers.BooleanField(read_only=True)
+    days_overdue = serializers.IntegerField(read_only=True)
+    duration_days = serializers.IntegerField(read_only=True)
+    is_open_ended = serializers.BooleanField(read_only=True)
+    payments = RentalPaymentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Rental
+        fields = [
+            'id', 'code', 'renter', 'renter_name', 'equipment', 'equipment_name',
+            'branch', 'branch_name', 'start_date', 'due_date', 'extended_to',
+            'rental_rate', 'currency', 'quantity',
+            'returned', 'returned_at', 'notes', 'created_by', 'created_by_name', 'created_at',
+            'total_rental_cost', 'total_paid', 'balance_due',
+            'is_overdue', 'days_overdue', 'duration_days', 'is_open_ended', 'payments'
+        ]
+        read_only_fields = [
+            'id', 'code', 'branch', 'created_by', 'created_by_name',
+            'renter_name', 'equipment_name', 'branch_name',
+            'total_rental_cost', 'total_paid', 'balance_due',
+            'is_overdue', 'days_overdue', 'duration_days', 'is_open_ended'
+        ]
+
+    def get_renter_name(self, obj):
+        renter = getattr(obj, "renter", None)
+        if renter:
+            return getattr(renter, 'full_name', None) or (renter.get_full_name() if hasattr(renter, 'get_full_name') else None) or renter.email
+        logger.warning(f"Invalid renter for rental {obj.id}: {obj.renter} (type: {type(obj.renter)})")
+        return ""
+
+    def get_created_by_name(self, obj):
+        user = getattr(obj, 'created_by', None)
+        if user:
+            return getattr(user, 'full_name', None) or (user.get_full_name() if hasattr(user, 'get_full_name') else None) or user.email
+        return "N/A"
+
+    def validate(self, data):
+        method = self.context['request'].method
+        if method in ['POST', 'PATCH']:
+            required = ['equipment', 'renter', 'start_date', 'quantity'] if method == 'POST' else []
+            for field in required:
+                if not data.get(field):
+                    raise serializers.ValidationError(f"{field.replace('_', ' ').title()} is required.")
+            if 'renter' in data:
+                renter_input = data['renter']
+                if isinstance(renter_input, str):
+                    try:
+                        # Try by ID first
+                        data['renter'] = User.objects.get(id=int(renter_input))
+                    except (ValueError, User.DoesNotExist):
+                        try:
+                            # Fallback to email
+                            data['renter'] = User.objects.get(email=renter_input)
+                        except User.DoesNotExist:
+                            logger.error(f"Invalid renter input: {renter_input} (type: {type(renter_input)})")
+                            raise serializers.ValidationError(f"Invalid renter: no user found with ID or email '{renter_input}'.")
+                elif not isinstance(renter_input, User) or not hasattr(renter_input, 'get_full_name'):
+                    logger.error(f"Invalid renter input: {renter_input} (type: {type(renter_input)})")
+                    raise serializers.ValidationError(f"Invalid renter: must be a valid User instance, got {renter_input}.")
+            if data.get('quantity', 1) <= 0:
+                raise serializers.ValidationError("Quantity must be at least 1.")
+            if 'due_date' in data and data['due_date'] == '':
+                data['due_date'] = None
+            if data.get('due_date') and data.get('start_date') and data['start_date'] > data['due_date']:
+                raise serializers.ValidationError("Due date must be after start date.")
+            if method == 'POST':
+                equipment = data['equipment']
+                reserved_quantity = equipment.reservations.filter(
+                    is_active=True,
+                    start_date__lte=data['start_date'],
+                    end_date__gte=data['start_date']
+                ).aggregate(models.Sum('quantity'))['quantity__sum'] or 0
+                rented_quantity = equipment.rentals.filter(returned=False).aggregate(
+                    models.Sum('quantity'))['quantity__sum'] or 0
+                available = equipment.total_quantity - reserved_quantity - rented_quantity
+                if data['quantity'] > available:
+                    raise serializers.ValidationError(f"Only {available} units available for rental.")
+        if method == 'PATCH' and 'returned' in data and data['returned']:
+            if self.instance and self.instance.returned:
+                raise serializers.ValidationError("Rental is already returned.")
+        return data
+
+class NotificationSerializer(serializers.ModelSerializer):
+    rental_code = serializers.CharField(source='related_rental.code', read_only=True)
+    equipment_name = serializers.CharField(source='related_equipment.name', read_only=True)
+
+    class Meta:
+        model = Notification
+        fields = ['id', 'type', 'severity', 'title', 'message', 'is_read', 'created_at', 'rental_code', 'equipment_name']
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+views.py:
+# rentals/views.py
+import logging
+from io import BytesIO
+from datetime import datetime
+
+from django.http import HttpResponse
+from django.utils import timezone
+from django.db.models import Q
+from django.conf import settings
+
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+
+from decimal import Decimal
+
+# Import models / serializers
+from .models import Equipment, Rental, RentalPayment, Branch, Reservation, Notification
+from .serializers import (
+    EquipmentSerializer, RentalSerializer, RentalPaymentSerializer,
+    BranchSerializer, ReservationSerializer, NotificationSerializer
+)
+
+logger = logging.getLogger(__name__)
+
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+class BranchViewSet(ModelViewSet):
+    queryset = Branch.objects.all().order_by('name')
+    serializer_class = BranchSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class EquipmentViewSet(ModelViewSet):
+    """
+    Equipment endpoints. Accepts JSON and multipart/form-data for uploads.
+    NOTE: parser_classes must be parser classes, not strings.
+    """
+    queryset = Equipment.objects.select_related('branch', 'created_by').all().order_by('-created_at')
+    serializer_class = EquipmentSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    # Correct usage: parser classes are the class objects, not their string names
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) |
+                Q(category__icontains=search) |
+                Q(location__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class RentalViewSet(ModelViewSet):
+    queryset = Rental.objects.select_related(
+        'renter', 'equipment', 'branch', 'approved_by', 'created_by'
+    ).prefetch_related('payments').all().order_by('-created_at')
+    serializer_class = RentalSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        search = self.request.query_params.get('search', None)
+        overdue_unpaid = self.request.query_params.get('overdue_unpaid', None)
+        if search:
+            queryset = queryset.filter(
+                Q(code__icontains=search) |
+                Q(equipment__name__icontains=search) |
+                Q(renter__email__icontains=search) |
+                Q(renter__first_name__icontains=search) |
+                Q(renter__last_name__icontains=search)
+            )
+        if overdue_unpaid == 'true':
+            queryset = queryset.filter(
+                Q(returned=False) & Q(due_date__lt=timezone.now().date())
+            )
+        return queryset
+
+    def list(self, request, *args, **kwargs):
+        """
+        Keep server-side filtering/pagination and also apply the 'overdue_unpaid'
+        python-side filter after serialization only when requested.
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+        overdue_unpaid = request.query_params.get('overdue_unpaid', None)
+
+        try:
+            # Use pagination if requested/needed
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                data = serializer.data
+                if overdue_unpaid == 'true':
+                    data = [item for item in data if Decimal(item.get('balance_due', '0')) > 0 or item.get('is_overdue')]
+                return self.get_paginated_response(data)
+
+            # Non-paginated path
+            serializer = self.get_serializer(queryset, many=True)
+            data = serializer.data
+            if overdue_unpaid == 'true':
+                data = [item for item in data if Decimal(item.get('balance_due', '0')) > 0 or item.get('is_overdue')]
+            return Response(data)
+        except Exception as e:
+            logger.exception("Serialization error in RentalViewSet.list")
+            raise
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    def extend_rental(self, request, pk=None):
+        rental = self.get_object()
+        if rental.is_open_ended:
+            return Response({'error': 'Cannot extend open-ended rental.'}, status=400)
+        if rental.returned:
+            return Response({'error': 'Cannot extend a returned rental.'}, status=400)
+        new_due_date_str = request.data.get('new_due_date')
+        if not new_due_date_str:
+            return Response({'error': 'New due date is required.'}, status=400)
+        try:
+            new_due_date = datetime.strptime(new_due_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=400)
+        if new_due_date <= rental.start_date:
+            return Response({'error': 'New due date must be after start date.'}, status=400)
+        if rental.effective_due_date and new_due_date <= rental.effective_due_date:
+            return Response({'error': 'New due date must be after current due date.'}, status=400)
+        rental.extended_to = new_due_date
+        rental.save(update_fields=['extended_to'])
+        # Create a notification for the renter (use your Notification model's fields)
+        Notification.objects.create(
+            user=rental.renter,
+            type='INFO',
+            severity='INFO',
+            title='Rental Extended',
+            message=f"Rental {rental.code} for {rental.equipment.name} has been extended to {new_due_date}.",
+            related_rental=rental
+        )
+        return Response({
+            'message': 'Rental extended successfully.',
+            'extended_to': new_due_date.isoformat()
+        })
+
+    @action(detail=True, methods=['post'])
+    def mark_returned(self, request, pk=None):
+        rental = self.get_object()
+        if rental.returned:
+            return Response({'error': 'Rental is already returned.'}, status=400)
+        rental.returned = True
+        rental.returned_at = timezone.now()
+        rental.save()
+        Notification.objects.create(
+            user=rental.renter,
+            type='INFO',
+            severity='INFO',
+            title='Rental Returned',
+            message=f"Rental {rental.code} for {rental.equipment.name} has been returned.",
+            related_rental=rental
+        )
+        return Response({'message': 'Rental marked as returned.'})
+
+    @action(detail=False, methods=['post'])
+    def bulk_return(self, request):
+        rental_ids = request.data.get('ids', [])
+        if not isinstance(rental_ids, (list, tuple)):
+            return Response({'error': 'Invalid ids payload. Must be a list of ids.'}, status=400)
+        updated = 0
+        for rental_id in rental_ids:
+            try:
+                rental = Rental.objects.get(id=rental_id, returned=False)
+                rental.returned = True
+                rental.returned_at = timezone.now()
+                rental.save()
+                Notification.objects.create(
+                    user=rental.renter,
+                    type='INFO',
+                    severity='INFO',
+                    title='Rental Returned',
+                    message=f"Rental {rental.code} for {rental.equipment.name} has been returned.",
+                    related_rental=rental
+                )
+                updated += 1
+            except Rental.DoesNotExist:
+                continue
+        return Response({'message': f'{updated} rentals marked as returned.'})
+
+    @action(detail=False, methods=['post'])
+    def bulk_delete(self, request):
+        rental_ids = request.data.get('ids', [])
+        if not isinstance(rental_ids, (list, tuple)):
+            return Response({'error': 'Invalid ids payload. Must be a list of ids.'}, status=400)
+        deleted = 0
+        for rental_id in rental_ids:
+            try:
+                rental = Rental.objects.get(id=rental_id)
+                if not rental.returned:
+                    # only delete returned rentals to avoid accidental deletion
+                    continue
+                rental.delete()
+                deleted += 1
+            except Rental.DoesNotExist:
+                continue
+        return Response({'message': f'{deleted} rentals deleted.'})
+
+    @action(detail=True, methods=['get'])
+    def receipt_pdf(self, request, pk=None):
+        rental = self.get_object()
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch
+        )
+        elements = []
+        styles = getSampleStyleSheet()
+
+        title_style = ParagraphStyle(
+            'ReceiptTitle', parent=styles['Heading1'],
+            fontSize=16, alignment=1, spaceAfter=8, leading=20,
+            textColor=colors.HexColor("#333333")
+        )
+        section_heading = ParagraphStyle(
+            'SectionHeading', parent=styles['Heading3'],
+            fontSize=10.5, spaceBefore=6, spaceAfter=6,
+            textColor=colors.HexColor("#2b2b2b"), leading=13
+        )
+        small_info = ParagraphStyle(
+            'SmallInfo', parent=styles['Normal'],
+            fontSize=9, leading=12, textColor=colors.black
+        )
+
+        # Header
+        try:
+            if getattr(settings, 'COMPANY_LOGO_PATH', None):
+                logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.0 * inch, height=0.6 * inch)
+                header_table = Table([[  # logo + company + meta
+                    logo_img,
+                    Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/><span>{getattr(settings, 'COMPANY_TAGLINE', '')}</span>", styles['Title']),
+                    Paragraph(
+                        f"<b>Receipt No.</b><br/>{rental.code}<br/><br/>"
+                        f"<b>Date</b><br/>{rental.created_at.strftime('%d/%m/%Y %H:%M')}",
+                        small_info
+                    )
+                ]], colWidths=[1.0 * inch, 4.3 * inch, 2.2 * inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+            else:
+                raise Exception("No company logo configured")
+        except Exception as e:
+            logger.warning(f"Logo load failed or no logo configured: {e}")
+            header_table = Table([[  # fallback header
+                Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b>", styles['Title']),
+                Paragraph(
+                    f"<b>Receipt No.</b><br/>{rental.code}<br/><br/>"
+                    f"<b>Date</b><br/>{rental.created_at.strftime('%d/%m/%Y %H:%M')}",
+                    small_info
+                )
+            ]], colWidths=[5.3 * inch, 2.2 * inch])
+            header_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+            ]))
+            elements.append(header_table)
+            elements.append(Spacer(1, 12))
+
+        # Title
+        elements.append(Paragraph("EQUIPMENT RENTAL RECEIPT", title_style))
+        elements.append(Spacer(1, 8))
+
+        # Rental Info
+        elements.append(Paragraph("<b>RENTAL DETAILS</b>", section_heading))
+        rental_data = [
+            ["Rental Code", rental.code],
+            ["Renter", getattr(rental.renter, 'get_full_name', lambda: None)() or getattr(rental.renter, 'email', '')],
+            ["Equipment", rental.equipment.name if rental.equipment else "—"],
+            ["Quantity", str(rental.quantity)],
+            ["Start Date", rental.start_date.strftime('%d/%m/%Y') if rental.start_date else "—"],
+            ["Due Date", rental.effective_due_date.strftime('%d/%m/%Y') if rental.effective_due_date else "Open-ended"],
+            ["Status", "Returned" if rental.returned else "Active"],
+        ]
+        rental_table = Table(rental_data, colWidths=[2.0 * inch, 4.1 * inch])
+        rental_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(rental_table)
+        elements.append(Spacer(1, 12))
+
+        # Financial Summary
+        elements.append(Paragraph("<b>FINANCIAL SUMMARY</b>", section_heading))
+        fin_data = [
+            ["Rental Rate", f"{getattr(rental, 'rental_rate', 0)} {getattr(rental, 'currency', '')}/day"],
+            ["Duration (days)", str(getattr(rental, 'duration_days', '—'))],
+            ["Total Incurred", f"{getattr(rental, 'total_rental_cost', '0')} {getattr(rental, 'currency', '')}"],
+            ["Total Paid", f"{getattr(rental, 'total_paid', '0')} {getattr(rental, 'currency', '')}"],
+            ["Balance Due", f"{getattr(rental, 'balance_due', '0')} {getattr(rental, 'currency', '')}"],
+        ]
+        fin_table = Table(fin_data, colWidths=[2.0 * inch, 4.1 * inch])
+        fin_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(fin_table)
+        elements.append(Spacer(1, 12))
+
+        # Payments
+        elements.append(Paragraph("<b>PAYMENTS</b>", section_heading))
+        payment_rows = [["Date", "Amount", "In Words", "Status"]]
+        for p in rental.payments.all():
+            payment_rows.append([
+                getattr(p, 'payment_date', timezone.now()).strftime('%d/%m/%Y') if getattr(p, 'payment_date', None) else "—",
+                f"{getattr(p, 'amount_paid', '—')} {getattr(rental, 'currency', '')}",
+                getattr(p, 'amount_in_words', '—'),
+                getattr(p, 'status', '—')
+            ])
+        if len(payment_rows) == 1:
+            payment_rows.append(["—", "—", "—", "No payments recorded"])
+        pay_table = Table(payment_rows, colWidths=[1.2 * inch, 1.5 * inch, 2.4 * inch, 1.0 * inch])
+        pay_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#E0E0E0")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(pay_table)
+        elements.append(Spacer(1, 18))
+
+        # Footer
+        footer_table = Table([[  # small footer
+            Paragraph("<i>This rental receipt is auto-generated.</i>", styles['Italic']),
+            Paragraph(f"{getattr(settings, 'COMPANY_NAME', '')}", small_info)
+        ]], colWidths=[4.6 * inch, 2.0 * inch])
+        footer_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#333333")),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.whitesmoke),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+        ]))
+        elements.append(footer_table)
+
+        doc.build(elements)
+        buffer.seek(0)
+        filename = f"Rental_{rental.code}_receipt.pdf"
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
+
+class ReservationViewSet(ModelViewSet):
+    queryset = Reservation.objects.select_related('equipment', 'reserved_for', 'created_by').all().order_by('-created_at')
+    serializer_class = ReservationSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(equipment__name__icontains=search) |
+                Q(reserved_for__email__icontains=search) |
+                Q(reserved_for__first_name__icontains=search) |
+                Q(reserved_for__last_name__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        # Soft-delete pattern if desired
+        instance.is_active = False
+        instance.equipment.save()
+        instance.delete()
+
+
+class RentalPaymentViewSet(ModelViewSet):
+    queryset = RentalPayment.objects.select_related('rental__renter', 'rental__equipment').all().order_by('-created_at')
+    serializer_class = RentalPaymentSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(rental__code__icontains=search) |
+                Q(rental__equipment__name__icontains=search) |
+                Q(rental__renter__email__icontains=search) |
+                Q(rental__renter__first_name__icontains=search) |
+                Q(rental__renter__last_name__icontains=search)
+            )
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class EquipmentReportPDFView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]  # GET typically doesn't need parser, but safe to have
+
+    def get(self, request):
+        equipment_list = Equipment.objects.select_related('branch').all().order_by('name')
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch
+        )
+        elements = []
+        styles = getSampleStyleSheet()
+
+        title_style = ParagraphStyle(
+            'ReportTitle', parent=styles['Heading1'],
+            fontSize=16, alignment=1, spaceAfter=12, leading=20,
+            textColor=colors.HexColor("#333333")
+        )
+        section_heading = ParagraphStyle(
+            'SectionHeading', parent=styles['Heading3'],
+            fontSize=11, spaceBefore=8, spaceAfter=6,
+            textColor=colors.HexColor("#2b2b2b")
+        )
+        normal = styles['Normal']
+
+        elements.append(Paragraph("EQUIPMENT INVENTORY REPORT", title_style))
+        elements.append(Paragraph(f"Generated on: {timezone.now().strftime('%d/%m/%Y %H:%M')}", normal))
+        elements.append(Spacer(1, 12))
+
+        table_data = [
+            ["#", "Name", "Category", "Branch", "Total Qty", "Available Qty", "Status", "Expiry"]
+        ]
+        for idx, eq in enumerate(equipment_list, 1):
+            status = "Available" if eq.available_quantity == eq.total_quantity else "Partially Available" if eq.available_quantity > 0 else "Unavailable"
+            expiry = eq.expiry_date.strftime('%d/%m/%Y') if eq.expiry_date else "—"
+            if eq.expiry_date and eq.expiry_date < timezone.now().date():
+                expiry = f"EXPIRED ({expiry})"
+            table_data.append([
+                str(idx),
+                eq.name,
+                eq.category,
+                eq.branch.name if eq.branch else "—",
+                str(eq.total_quantity),
+                str(eq.available_quantity),
+                status,
+                expiry
+            ])
+        col_widths = [0.4 * inch, 1.5 * inch, 1.0 * inch, 1.2 * inch, 0.8 * inch, 0.9 * inch, 1.0 * inch, 1.2 * inch]
+        table = Table(table_data, colWidths=col_widths)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#4CAF50")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(table)
+        doc.build(elements)
+        buffer.seek(0)
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = 'attachment; filename="equipment_inventory_report.pdf"'
+        return response
+
+
+class NotificationViewSet(ModelViewSet):
+    """
+    Notifications for the authenticated user. The router will infer basename if you
+    provide queryset attribute (which we do).
+    """
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
+
+    # Provide a base queryset; get_queryset will narrow it to the requesting user
+    queryset = Notification.objects.all()
+
+    def get_queryset(self):
+        # Only return unread notifications by default for the requesting user
+        user = getattr(self.request, 'user', None)
+        if not user or user.is_anonymous:
+            return Notification.objects.none()
+        return self.queryset.filter(user=user, is_read=False)
+
+    @action(detail=False, methods=['post'])
+    def mark_all_as_read(self, request):
+        qs = self.queryset.filter(user=request.user, is_read=False)
+        updated_count = qs.update(is_read=True)
+        return Response({'status': 'success', 'updated': updated_count})
+
+    @action(detail=True, methods=['post'])
+    def mark_as_read(self, request, pk=None):
+        notification = self.get_object()
+        if notification.user != request.user:
+            return Response({'error': 'Not allowed'}, status=403)
+        notification.is_read = True
+        notification.save()
+        return Response({'status': 'success'})
+
+    @action(detail=False, methods=['get'])
+    def check_notifications(self, request):
+        """
+        Example: create or fetch notifications related to overdue rentals.
+        This method will:
+         - find overdue rentals (not returned and due_date in the past)
+         - attempt to ensure a notification exists for the renter
+         - then return notifications related to the authenticated user
+        """
+        # Find overdue rentals
+        rentals = Rental.objects.filter(
+            returned=False,
+            due_date__lt=timezone.now().date()
+        ).select_related('renter', 'equipment').prefetch_related('payments')
+
+        # Ensure notifications exist for the renters (not necessarily the request.user)
+        for rental in rentals:
+            # If you have a model method that creates notifications, call it; otherwise create safely here.
+            # Example: create a notification for the renter if balance_due > 0
+            try:
+                if getattr(rental, 'balance_due', 0) > 0:
+                    # create a notification for rental.renter (if not already exists and unread)
+                    Notification.objects.get_or_create(
+                        user=rental.renter,
+                        related_rental=rental,
+                        defaults={
+                            'type': 'ALERT',
+                            'severity': 'HIGH',
+                            'title': f'Overdue rental: {rental.code}',
+                            'message': f'Rental {rental.code} for {rental.equipment.name} is overdue and has an outstanding balance.',
+                            'is_read': False
+                        }
+                    )
+            except Exception:
+                # avoid blowing up the endpoint if one rental has issues
+                logger.exception(f"Failed to create/fetch notification for rental {getattr(rental, 'id', 'unknown')}")
+
+        # Return unread notifications for the authenticated user
+        notifications = self.queryset.filter(user=request.user, is_read=False).order_by('-created_at')[:50]
+        serializer = self.get_serializer(notifications, many=True)
+        return Response(serializer.data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+urls.py
+
+
+from rest_framework.routers import DefaultRouter
+from django.urls import path, include
+from .views import BranchViewSet, EquipmentViewSet, RentalViewSet, RentalPaymentViewSet, ReservationViewSet, EquipmentReportPDFView, NotificationViewSet
+
+router = DefaultRouter()
+router.register(r'branches', BranchViewSet)
+router.register(r'equipment', EquipmentViewSet)
+router.register(r'rentals', RentalViewSet)
+router.register(r'payments', RentalPaymentViewSet)
+router.register(r'reservations', ReservationViewSet)
+router.register(r'notifications', NotificationViewSet)
+
+urlpatterns = [
+    path('', include(router.urls)),
+    path('reports/equipment-pdf/', EquipmentReportPDFView.as_view(), name='equipment-report-pdf'),
+]
+
+
+
+
+
+
+
+active.jsx:
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  Container, Typography, Paper, Box, Button, Alert, Dialog, DialogTitle, DialogContent, DialogActions,
+  Grid, FormControl, InputLabel, Select, MenuItem, TextField, Accordion, AccordionSummary, AccordionDetails,
+  Table, TableHead, TableRow, TableCell, TableBody, IconButton, Pagination, Collapse, Chip, Checkbox, FormControlLabel,
+  CircularProgress
+} from '@mui/material';
+import AddIcon from '@mui/icons-material/Add';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+import EditIcon from '@mui/icons-material/Edit';
+import DeleteIcon from '@mui/icons-material/Delete';
+import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
+import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
+import WarningIcon from '@mui/icons-material/Warning';
+import PaymentIcon from '@mui/icons-material/Payment';
+import PictureAsPdfIcon from '@mui/icons-material/PictureAsPdf';
+import NotificationsIcon from '@mui/icons-material/Notifications';
+import API from '../../api';
+import { useSearch } from '../../context/SearchContext';
+import dayjs from 'dayjs';
+
+const CURRENCY_OPTIONS = [
+  { value: 'NGN', label: 'Nigerian Naira (₦)' },
+  { value: 'USD', label: 'US Dollar ($)' },
+];
+
+function RentalRow({ 
+  rental, 
+  onEdit, 
+  onDelete, 
+  onMarkReturned,
+  onExtend,
+  hasUpdatePermission, 
+  hasDeletePermission, 
+  hasReturnPermission,
+  hasExtendPermission,
+  onSelect,
+  selected,
+  onDownloadReceipt,
+  onAddPayment,
+  isLoading
+}) {
+  const [open, setOpen] = useState(false);
+
+  const getDuration = useCallback(() => {
+    if (rental.returned) return rental.duration_days || 0;
+    if (rental.is_open_ended) {
+      const start = new Date(rental.start_date);
+      const today = new Date();
+      return Math.ceil((today - start) / (1000 * 60 * 60 * 24));
+    }
+    return rental.duration_days || 0;
+  }, [rental]);
+
+  const formatCurrency = useCallback((amount, currency) => {
+    if (!amount && amount !== 0) return '—';
+    return currency === 'NGN' 
+      ? `₦${Number(amount).toLocaleString()}`
+      : `$${Number(amount).toLocaleString()}`;
+  }, []);
+
+  return (
+    <>
+      <TableRow sx={{ '& > *': { borderBottom: 'unset' }, cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+        <TableCell padding="checkbox">
+          <Checkbox
+            checked={selected}
+            onChange={(e) => {
+              e.stopPropagation();
+              onSelect(rental.id);
+            }}
+            disabled={rental.returned || isLoading}
+          />
+        </TableCell>
+        <TableCell>
+          <IconButton
+            aria-label="expand row"
+            size="small"
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(!open);
+            }}
+            disabled={isLoading}
+          >
+            {open ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
+          </IconButton>
+        </TableCell>
+        <TableCell>{rental.code}</TableCell>
+        <TableCell>{rental.renter_name || '—'}</TableCell>
+        <TableCell>{rental.equipment_name || '—'}</TableCell>
+        <TableCell>{rental.start_date ? dayjs(rental.start_date).format('DD/MM/YYYY') : '—'}</TableCell>
+        <TableCell>
+          {rental.is_open_ended ? (
+            'Open-ended'
+          ) : rental.effective_due_date ? (
+            <>
+              {dayjs(rental.effective_due_date).format('DD/MM/YYYY')}
+              {rental.is_overdue && (
+                <WarningIcon color="error" fontSize="small" sx={{ ml: 1 }} />
+              )}
+            </>
+          ) : (
+            '—'
+          )}
+        </TableCell>
+        <TableCell>
+          {isLoading ? (
+            <CircularProgress size={20} />
+          ) : (
+            <>
+              {!rental.returned && (
+                <>
+                  <Button 
+                    size="small" 
+                    variant="outlined" 
+                    color="success" 
+                    onClick={(e) => { e.stopPropagation(); onMarkReturned(rental.id); }}
+                    disabled={!hasReturnPermission}
+                    sx={{ mr: 1 }}
+                  >
+                    Return
+                  </Button>
+                  {!rental.is_open_ended && (
+                    <Button 
+                      size="small" 
+                      variant="outlined" 
+                      color="info" 
+                      onClick={(e) => { e.stopPropagation(); onExtend(rental); }}
+                      disabled={!hasExtendPermission}
+                      sx={{ mr: 1 }}
+                    >
+                      Extend
+                    </Button>
+                  )}
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<PaymentIcon />}
+                    onClick={(e) => { e.stopPropagation(); onAddPayment(rental.id); }}
+                    sx={{ mr: 1 }}
+                  >
+                    Add Payment
+                  </Button>
+                </>
+              )}
+              <IconButton 
+                onClick={(e) => { e.stopPropagation(); onEdit(rental); }} 
+                color="primary" 
+                size="small" 
+                disabled={!hasUpdatePermission || rental.returned}
+              >
+                <EditIcon />
+              </IconButton>
+              <IconButton 
+                onClick={(e) => { e.stopPropagation(); onDelete(rental.id); }} 
+                color="error" 
+                size="small" 
+                disabled={!hasDeletePermission}
+              >
+                <DeleteIcon />
+              </IconButton>
+              <IconButton
+                onClick={(e) => { e.stopPropagation(); onDownloadReceipt(rental.id); }}
+                color="secondary"
+                size="small"
+              >
+                <PictureAsPdfIcon />
+              </IconButton>
+            </>
+          )}
+        </TableCell>
+      </TableRow>
+      <TableRow>
+        <TableCell style={{ paddingBottom: 0, paddingTop: 0 }} colSpan={8}>
+          <Collapse in={open} timeout="auto" unmountOnExit>
+            <Box sx={{ margin: 2 }}>
+              <Typography variant="h6" gutterBottom component="div">
+                Rental Details
+              </Typography>
+              <Grid container spacing={2}>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>ID:</strong> {rental.id}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Branch:</strong> {rental.branch_name || '—'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Quantity:</strong> {rental.quantity}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Duration:</strong> {getDuration()} days</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography>
+                    <strong>Days Overdue:</strong>{' '}
+                    {rental.is_overdue && rental.days_overdue > 0 ? (
+                      <Chip label={`${rental.days_overdue} days`} color="error" size="small" />
+                    ) : (
+                      '—'
+                    )}
+                  </Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Currency:</strong> {rental.currency || 'NGN'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Rental Rate:</strong> {rental.rental_rate ? formatCurrency(rental.rental_rate, rental.currency) : '—'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Total Incurred:</strong> {formatCurrency(rental.total_rental_cost, rental.currency)}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Total Paid:</strong> {formatCurrency(rental.total_paid, rental.currency)}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Balance Due:</strong> {formatCurrency(rental.balance_due, rental.currency)}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Created By:</strong> {rental.created_by_name || '—'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Created At:</strong> {rental.created_at ? dayjs(rental.created_at).format('DD/MM/YYYY HH:mm') : '—'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Returned:</strong> {rental.returned ? 'Yes' : 'No'}</Typography>
+                </Grid>
+                <Grid item xs={12} sm={6}>
+                  <Typography><strong>Returned At:</strong> {rental.returned_at ? dayjs(rental.returned_at).format('DD/MM/YYYY HH:mm') : '—'}</Typography>
+                </Grid>
+                <Grid item xs={12}>
+                  <Typography><strong>Notes:</strong> {rental.notes || '—'}</Typography>
+                </Grid>
+              </Grid>
+
+              {/* Payments Section */}
+              <Box mt={3}>
+                <Typography variant="h6" gutterBottom>Payment History</Typography>
+                {rental.payments && rental.payments.length > 0 ? (
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Date</TableCell>
+                        <TableCell>Amount</TableCell>
+                        <TableCell>Status</TableCell>
+                        <TableCell>In Words</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {rental.payments.map((payment) => (
+                        <TableRow key={payment.id}>
+                          <TableCell>{dayjs(payment.payment_date).format('DD/MM/YYYY')}</TableCell>
+                          <TableCell>{formatCurrency(payment.amount_paid, rental.currency)}</TableCell>
+                          <TableCell>
+                            <Chip 
+                              label={payment.status} 
+                              color={payment.status === 'Paid' ? 'success' : 'warning'} 
+                              size="small" 
+                            />
+                          </TableCell>
+                          <TableCell>{payment.amount_in_words || '—'}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                ) : (
+                  <Typography variant="body2" color="textSecondary">No payments recorded.</Typography>
+                )}
+              </Box>
+            </Box>
+          </Collapse>
+        </TableCell>
+      </TableRow>
+    </>
+  );
+}
+
+function ReservationRow({ reservation, onEdit, onDelete, hasUpdatePermission, hasDeletePermission, isLoading }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      <TableRow sx={{ '& > *': { borderBottom: 'unset' } }}>
+        <TableCell>
+          <IconButton
+            aria-label="expand row"
+            size="small"
+            onClick={() => setOpen(!open)}
+            disabled={isLoading}
+          >
+            {open ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
+          </IconButton>
+        </TableCell>
+        <TableCell>{reservation.equipment_name}</TableCell>
+        <TableCell>{reservation.start_date ? dayjs(reservation.start_date).format('DD/MM/YYYY') : '—'}</TableCell>
+        <TableCell>{reservation.end_date ? dayjs(reservation.end_date).format('DD/MM/YYYY') : 'Open-ended'}</TableCell>
+        <TableCell>{reservation.quantity}</TableCell>
+        <TableCell>
+          {isLoading ? (
+            <CircularProgress size={20} />
+          ) : (
+            <>
+              <IconButton 
+                onClick={() => onEdit(reservation)} 
+                color="primary" 
+                size="small" 
+                disabled={!hasUpdatePermission}
+              >
+                <EditIcon />
+              </IconButton>
+              <IconButton 
+                onClick={() => onDelete(reservation.id)} 
+                color="error" 
+                size="small" 
+                disabled={!hasDeletePermission}
+              >
+                <DeleteIcon />
+              </IconButton>
+            </>
+          )}
+        </TableCell>
+      </TableRow>
+      <TableRow>
+        <TableCell style={{ paddingBottom: 0, paddingTop: 0 }} colSpan={6}>
+          <Collapse in={open} timeout="auto" unmountOnExit>
+            <Box sx={{ margin: 2 }}>
+              <Typography variant="body2"><strong>Reserved For:</strong> {reservation.reserved_for_name || '—'}</Typography>
+              <Typography variant="body2"><strong>Status:</strong> {reservation.is_active ? 'Active' : 'Inactive'}</Typography>
+              <Typography variant="body2"><strong>Created At:</strong> {reservation.created_at ? dayjs(reservation.created_at).format('DD/MM/YYYY HH:mm') : '—'}</Typography>
+            </Box>
+          </Collapse>
+        </TableCell>
+      </TableRow>
+    </>
+  );
+}
+
+export default function ActiveRentals() {
+  const [rentals, setRentals] = useState([]);
+  const [reservations, setReservations] = useState([]);
+  const [equipmentList, setEquipmentList] = useState([]);
+  const [usersList, setUsersList] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [formData, setFormData] = useState({
+    equipment: '',
+    renter: '',
+    start_date: '',
+    due_date: '',
+    currency: 'NGN',
+    rental_rate: '',
+    notes: '',
+    quantity: 1,
+    is_open_ended: false
+  });
+  const [reservationForm, setReservationForm] = useState({
+    equipment: '',
+    start_date: '',
+    end_date: '',
+    quantity: 1,
+    is_open_ended: false
+  });
+  const [paymentForm, setPaymentForm] = useState({
+    rental: '',
+    amount_paid: '',
+    amount_in_words: '',
+    status: 'Paid'
+  });
+  const [openDialog, setOpenDialog] = useState(false);
+  const [openReservationDialog, setOpenReservationDialog] = useState(false);
+  const [openPaymentDialog, setOpenPaymentDialog] = useState(false);
+  const [openDeleteDialog, setOpenDeleteDialog] = useState(false);
+  const [openReservationDeleteDialog, setOpenReservationDeleteDialog] = useState(false);
+  const [openReturnDialog, setOpenReturnDialog] = useState(false);
+  const [openExtendDialog, setOpenExtendDialog] = useState(false);
+  const [openBulkDialog, setOpenBulkDialog] = useState(false);
+  const [openNotificationsDialog, setOpenNotificationsDialog] = useState(false);
+  const [bulkAction, setBulkAction] = useState('return');
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [actionLoading, setActionLoading] = useState({});
+  const [deleteId, setDeleteId] = useState(null);
+  const [reservationDeleteId, setReservationDeleteId] = useState(null);
+  const [returnId, setReturnId] = useState(null);
+  const [extendRental, setExtendRental] = useState(null);
+  const [editId, setEditId] = useState(null);
+  const [reservationEditId, setReservationEditId] = useState(null);
+  const [page, setPage] = useState(1);
+  const [reservationPage, setReservationPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [reservationTotalPages, setReservationTotalPages] = useState(1);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [checkingPermissions, setCheckingPermissions] = useState(true);
+  const [hasPermission, setHasPermission] = useState(false);
+  const [hasCreatePermission, setHasCreatePermission] = useState(false);
+  const [hasUpdatePermission, setHasUpdatePermission] = useState(false);
+  const [hasDeletePermission, setHasDeletePermission] = useState(false);
+  const [hasReturnPermission, setHasReturnPermission] = useState(false);
+  const [hasExtendPermission, setHasExtendPermission] = useState(false);
+  const [hasReservationPermission, setHasReservationPermission] = useState(false);
+  const [hasCreateReservationPermission, setHasCreateReservationPermission] = useState(false);
+  const [hasUpdateReservationPermission, setHasUpdateReservationPermission] = useState(false);
+  const [hasDeleteReservationPermission, setHasDeleteReservationPermission] = useState(false);
+  const [hasCreatePaymentPermission, setHasCreatePaymentPermission] = useState(false);
+  const [selectedRentals, setSelectedRentals] = useState([]);
+  const { searchTerm } = useSearch();
+  const itemsPerPage = 10;
+
+  // Fetch rentals
+  const fetchRentals = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      const res = await API.get('rentals/rentals/', {
+        params: { search: searchTerm, page, page_size: itemsPerPage, overdue_unpaid: true },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setRentals(res.data.results || []);
+      setTotalPages(Math.ceil((res.data.count || 0) / itemsPerPage));
+      setSelectedRentals([]);
+    } catch (err) {
+      setError(`❌ Failed to fetch rentals: ${err.response?.data?.detail || err.message}`);
+    }
+  }, [searchTerm, page]);
+
+  // Fetch reservations
+  const fetchReservations = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      const res = await API.get('rentals/reservations/', {
+        params: { search: searchTerm, page: reservationPage, page_size: itemsPerPage },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setReservations(res.data.results || []);
+      setReservationTotalPages(Math.ceil((res.data.count || 0) / itemsPerPage));
+    } catch (err) {
+      setError(`❌ Failed to fetch reservations: ${err.response?.data?.detail || err.message}`);
+    }
+  }, [searchTerm, reservationPage]);
+
+  // Fetch equipment
+  const fetchEquipment = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      const res = await API.get('rentals/equipment/', {
+        params: { page_size: 100 },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setEquipmentList(res.data.results || []);
+    } catch (err) {
+      setError(`❌ Failed to fetch equipment: ${err.response?.data?.detail || err.message}`);
+    }
+  }, []);
+
+  // Fetch users
+  const fetchUsers = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      const res = await API.get('auth/users/', {
+        params: { page_size: 100 },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setUsersList(res.data.results || []);
+    } catch (err) {
+      console.warn('Failed to fetch users for renter selection:', err.message);
+    }
+  }, []);
+
+  // Fetch notifications
+  const fetchNotifications = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      const res = await API.get('rentals/notifications/check_notifications/', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setNotifications(res.data || []);
+    } catch (err) {
+      setError(`❌ Failed to fetch notifications: ${err.response?.data?.detail || err.message}`);
+    }
+  }, []);
+
+  // Download equipment report
+  const handleDownloadEquipmentReport = async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, equipmentReport: true }));
+      const response = await API.get('/rentals/reports/equipment-pdf/', {
+        responseType: 'blob',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', 'equipment_inventory_report.pdf');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      setSuccess('✅ Equipment report downloaded successfully.');
+    } catch (err) {
+      setError(`❌ Failed to download equipment report: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, equipmentReport: false }));
+    }
+  };
+
+  // Download receipt
+  const handleDownloadReceipt = useCallback(async (rentalId) => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, [`receipt_${rentalId}`]: true }));
+      const response = await API.get(`/rentals/rentals/${rentalId}/receipt_pdf/`, {
+        responseType: 'blob',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `rental_${rentalId}_receipt.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      setSuccess('✅ Receipt downloaded successfully.');
+    } catch (err) {
+      setError(`❌ Failed to download receipt: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, [`receipt_${rentalId}`]: false }));
+    }
+  }, []);
+
+  const handleSelectRental = useCallback((id) => {
+    setSelectedRentals(prev =>
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  }, []);
+
+  const handleOpenDialog = useCallback((rental = null) => {
+    if (rental) {
+      setFormData({
+        equipment: rental.equipment,
+        renter: rental.renter,
+        start_date: rental.start_date ? dayjs(rental.start_date).format('YYYY-MM-DD') : '',
+        due_date: rental.effective_due_date ? dayjs(rental.effective_due_date).format('YYYY-MM-DD') : '',
+        currency: rental.currency || 'NGN',
+        rental_rate: rental.rental_rate || '',
+        notes: rental.notes || '',
+        quantity: rental.quantity || 1,
+        is_open_ended: !rental.effective_due_date
+      });
+      setEditId(rental.id);
+    } else {
+      setFormData({ 
+        equipment: '', 
+        renter: '', 
+        start_date: '', 
+        due_date: '',
+        currency: 'NGN',
+        rental_rate: '',
+        notes: '',
+        quantity: 1,
+        is_open_ended: false
+      });
+      setEditId(null);
+    }
+    setOpenDialog(true);
+  }, []);
+
+  const handleOpenPaymentDialog = useCallback((rentalId) => {
+    if (!hasCreatePaymentPermission) {
+      setError('⚠️ No permission to add payments.');
+      return;
+    }
+    setPaymentForm({
+      rental: rentalId,
+      amount_paid: '',
+      amount_in_words: '',
+      status: 'Paid'
+    });
+    setOpenPaymentDialog(true);
+  }, [hasCreatePaymentPermission]);
+
+  const handleOpenReservationDialog = useCallback((reservation = null) => {
+    if (reservation) {
+      setReservationForm({
+        equipment: reservation.equipment,
+        start_date: reservation.start_date ? dayjs(reservation.start_date).format('YYYY-MM-DD') : '',
+        end_date: reservation.end_date ? dayjs(reservation.end_date).format('YYYY-MM-DD') : '',
+        quantity: reservation.quantity || 1,
+        is_open_ended: !reservation.end_date
+      });
+      setReservationEditId(reservation.id);
+    } else {
+      setReservationForm({ 
+        equipment: '', 
+        start_date: '', 
+        end_date: '',
+        quantity: 1,
+        is_open_ended: false
+      });
+      setReservationEditId(null);
+    }
+    setOpenReservationDialog(true);
+  }, []);
+
+  const handleCloseDialog = useCallback(() => {
+    setOpenDialog(false);
+    setError('');
+    setSuccess('');
+  }, []);
+
+  const handleCloseReservationDialog = useCallback(() => {
+    setOpenReservationDialog(false);
+    setError('');
+    setSuccess('');
+  }, []);
+
+  const handleClosePaymentDialog = useCallback(() => {
+    setOpenPaymentDialog(false);
+    setError('');
+    setSuccess('');
+  }, []);
+
+  const handleDeleteOpen = useCallback((id) => {
+    if (!hasDeletePermission) {
+      setError('⚠️ No delete permission.');
+      return;
+    }
+    const rental = rentals.find(r => r.id === id);
+    if (rental && !rental.returned) {
+      setError('⚠️ Cannot delete unreturned rental. Please mark as returned first.');
+      return;
+    }
+    setDeleteId(id);
+    setOpenDeleteDialog(true);
+  }, [hasDeletePermission, rentals]);
+
+  const handleReservationDeleteOpen = useCallback((id) => {
+    if (!hasDeleteReservationPermission) {
+      setError('⚠️ No delete reservation permission.');
+      return;
+    }
+    setReservationDeleteId(id);
+    setOpenReservationDeleteDialog(true);
+  }, [hasDeleteReservationPermission]);
+
+  const handleDeleteClose = useCallback(() => {
+    setOpenDeleteDialog(false);
+    setDeleteId(null);
+  }, []);
+
+  const handleReservationDeleteClose = useCallback(() => {
+    setOpenReservationDeleteDialog(false);
+    setReservationDeleteId(null);
+  }, []);
+
+  const handleReturnOpen = useCallback((id) => {
+    if (!hasReturnPermission) {
+      setError('⚠️ No return permission.');
+      return;
+    }
+    setReturnId(id);
+    setOpenReturnDialog(true);
+  }, [hasReturnPermission]);
+
+  const handleReturnClose = useCallback(() => {
+    setOpenReturnDialog(false);
+    setReturnId(null);
+  }, []);
+
+  const handleExtendOpen = useCallback((rental) => {
+    if (!hasExtendPermission) {
+      setError('⚠️ No extend permission.');
+      return;
+    }
+    setExtendRental({ ...rental, new_due_date: '' });
+    setOpenExtendDialog(true);
+  }, [hasExtendPermission]);
+
+  const handleExtendClose = useCallback(() => {
+    setOpenExtendDialog(false);
+    setExtendRental(null);
+  }, []);
+
+  const handleNotificationsOpen = useCallback(() => {
+    setOpenNotificationsDialog(true);
+  }, []);
+
+  const handleNotificationsClose = useCallback(() => {
+    setOpenNotificationsDialog(false);
+  }, []);
+
+  const handleBulkOpen = useCallback((action) => {
+    if (selectedRentals.length === 0) {
+      setError('⚠️ Please select at least one unreturned rental.');
+      return;
+    }
+    if (action === 'return' && !hasReturnPermission) {
+      setError('⚠️ No return permission.');
+      return;
+    }
+    if (action === 'delete' && !hasDeletePermission) {
+      setError('⚠️ No delete permission.');
+      return;
+    }
+    setBulkAction(action);
+    setOpenBulkDialog(true);
+  }, [selectedRentals, hasReturnPermission, hasDeletePermission]);
+
+  const handleBulkClose = useCallback(() => {
+    setOpenBulkDialog(false);
+    setBulkLoading(false);
+  }, []);
+
+  const handleChange = useCallback((e) => {
+    const { name, value, type, checked } = e.target;
+    setFormData(prev => ({
+      ...prev,
+      [name]: type === 'checkbox' ? checked : value,
+      ...(name === 'is_open_ended' && checked ? { due_date: '' } : {})
+    }));
+  }, []);
+
+  const handleReservationChange = useCallback((e) => {
+    const { name, value, type, checked } = e.target;
+    setReservationForm(prev => ({
+      ...prev,
+      [name]: type === 'checkbox' ? checked : value,
+      ...(name === 'is_open_ended' && checked ? { end_date: '' } : {})
+    }));
+  }, []);
+
+  const handlePaymentChange = useCallback((e) => {
+    const { name, value } = e.target;
+    setPaymentForm(prev => ({ ...prev, [name]: value }));
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    const { equipment, renter, start_date, due_date, currency, rental_rate, notes, quantity, is_open_ended } = formData;
+    
+    if (!equipment || !renter || !start_date || !quantity) {
+      setError('⚠️ Equipment, Renter, Start Date, and Quantity are required.');
+      return;
+    }
+    
+    if (parseInt(quantity) <= 0) {
+      setError('⚠️ Quantity must be at least 1.');
+      return;
+    }
+    
+    const selectedEquipment = equipmentList.find(eq => eq.id === parseInt(equipment));
+    if (selectedEquipment && parseInt(quantity) > selectedEquipment.available_quantity) {
+      setError(`⚠️ Cannot rent ${quantity} units. Only ${selectedEquipment.available_quantity} available.`);
+      return;
+    }
+    
+    if (!is_open_ended && due_date && start_date > due_date) {
+      setError('⚠️ Due date must be after start date.');
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+
+      const payload = {
+        equipment: parseInt(equipment),
+        renter: parseInt(renter),
+        start_date,
+        due_date: is_open_ended ? null : (due_date || null),
+        currency,
+        rental_rate: rental_rate ? parseFloat(rental_rate) : null,
+        notes: notes || '',
+        quantity: parseInt(quantity)
+      };
+
+      setActionLoading(prev => ({ ...prev, saveRental: true }));
+      if (editId) {
+        await API.put(`rentals/rentals/${editId}/`, payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSuccess('✅ Rental updated.');
+      } else {
+        await API.post('rentals/rentals/', payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSuccess('✅ Rental created.');
+      }
+
+      await Promise.all([fetchRentals(), fetchEquipment(), fetchNotifications()]);
+      setOpenDialog(false);
+    } catch (err) {
+      let errorMsg = 'Save failed. Check required fields.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, saveRental: false }));
+    }
+  }, [formData, editId, equipmentList, fetchRentals, fetchEquipment, fetchNotifications]);
+
+  const handleSaveReservation = useCallback(async () => {
+    const { equipment, start_date, end_date, quantity, is_open_ended } = reservationForm;
+    
+    if (!equipment || !start_date || !quantity) {
+      setError('⚠️ Equipment, Start Date, and Quantity are required.');
+      return;
+    }
+    
+    if (parseInt(quantity) <= 0) {
+      setError('⚠️ Quantity must be at least 1.');
+      return;
+    }
+    
+    const selectedEquipment = equipmentList.find(eq => eq.id === parseInt(equipment));
+    if (selectedEquipment && parseInt(quantity) > selectedEquipment.available_quantity) {
+      setError(`⚠️ Cannot reserve ${quantity} units. Only ${selectedEquipment.available_quantity} available.`);
+      return;
+    }
+    
+    if (!is_open_ended && end_date && start_date > end_date) {
+      setError('⚠️ End date must be after start date.');
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+
+      const payload = {
+        equipment: parseInt(equipment),
+        reserved_for: parseInt(usersList[0]?.id || 1), // Default to first user or adjust based on backend
+        start_date,
+        end_date: is_open_ended ? null : (end_date || null),
+        quantity: parseInt(quantity)
+      };
+
+      setActionLoading(prev => ({ ...prev, saveReservation: true }));
+      if (reservationEditId) {
+        await API.put(`rentals/reservations/${reservationEditId}/`, payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSuccess('✅ Reservation updated.');
+      } else {
+        await API.post('rentals/reservations/', payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSuccess('✅ Reservation created.');
+      }
+
+      await Promise.all([fetchReservations(), fetchEquipment()]);
+      setOpenReservationDialog(false);
+    } catch (err) {
+      let errorMsg = 'Save failed. Check required fields.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, saveReservation: false }));
+    }
+  }, [reservationForm, reservationEditId, equipmentList, usersList, fetchReservations, fetchEquipment]);
+
+  const handleSavePayment = useCallback(async () => {
+    const { rental, amount_paid, amount_in_words, status } = paymentForm;
+    
+    if (!rental || !amount_paid || !amount_in_words) {
+      setError('⚠️ Rental, Amount Paid, and Amount in Words are required.');
+      return;
+    }
+    
+    if (parseFloat(amount_paid) <= 0) {
+      setError('⚠️ Amount paid must be positive.');
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+
+      const payload = {
+        rental: parseInt(rental),
+        amount_paid: parseFloat(amount_paid),
+        amount_in_words: amount_in_words.trim(),
+        status
+      };
+
+      setActionLoading(prev => ({ ...prev, savePayment: true }));
+      await API.post('rentals/payments/', payload, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess('✅ Payment recorded.');
+      await Promise.all([fetchRentals(), fetchNotifications()]);
+      setOpenPaymentDialog(false);
+    } catch (err) {
+      let errorMsg = 'Payment failed.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, savePayment: false }));
+    }
+  }, [paymentForm, fetchRentals, fetchNotifications]);
+
+  const handleDelete = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, [`delete_${deleteId}`]: true }));
+      await API.delete(`rentals/rentals/${deleteId}/`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess('✅ Rental deleted successfully.');
+      await Promise.all([fetchRentals(), fetchEquipment()]);
+      setOpenDeleteDialog(false);
+    } catch (err) {
+      let errorMsg = 'Delete failed.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, [`delete_${deleteId}`]: false }));
+    }
+  }, [deleteId, fetchRentals, fetchEquipment]);
+
+  const handleDeleteReservation = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, [`deleteReservation_${reservationDeleteId}`]: true }));
+      await API.delete(`rentals/reservations/${reservationDeleteId}/`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess('✅ Reservation deleted successfully.');
+      await Promise.all([fetchReservations(), fetchEquipment()]);
+      setOpenReservationDeleteDialog(false);
+    } catch (err) {
+      let errorMsg = 'Delete failed.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, [`deleteReservation_${reservationDeleteId}`]: false }));
+    }
+  }, [reservationDeleteId, fetchReservations, fetchEquipment]);
+
+  const handleMarkReturned = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, [`return_${returnId}`]: true }));
+      await API.post(`rentals/rentals/${returnId}/mark_returned/`, {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess('✅ Equipment marked as returned.');
+      await Promise.all([fetchRentals(), fetchEquipment(), fetchNotifications()]);
+      setOpenReturnDialog(false);
+    } catch (err) {
+      let errorMsg = 'Return failed.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, [`return_${returnId}`]: false }));
+    }
+  }, [returnId, fetchRentals, fetchEquipment, fetchNotifications]);
+
+  const handleExtendRental = useCallback(async () => {
+    if (!extendRental || !extendRental.new_due_date) {
+      setError('⚠️ New due date is required.');
+      return;
+    }
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, [`extend_${extendRental.id}`]: true }));
+      await API.post(`rentals/rentals/${extendRental.id}/extend_rental/`, { new_due_date: extendRental.new_due_date }, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess('✅ Rental extended successfully.');
+      await Promise.all([fetchRentals(), fetchNotifications()]);
+      setOpenExtendDialog(false);
+    } catch (err) {
+      let errorMsg = 'Extend failed.';
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, [`extend_${extendRental.id}`]: false }));
+    }
+  }, [extendRental, fetchRentals, fetchNotifications]);
+
+  const handleMarkNotificationsRead = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+      setActionLoading(prev => ({ ...prev, markNotifications: true }));
+      await API.post('rentals/notifications/mark_all_as_read/', {}, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSuccess('✅ All notifications marked as read.');
+      setNotifications([]);
+      setOpenNotificationsDialog(false);
+    } catch (err) {
+      setError(`❌ Failed to mark notifications as read: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setActionLoading(prev => ({ ...prev, markNotifications: false }));
+    }
+  }, []);
+
+  const handleSelectAll = useCallback((e) => {
+    if (e.target.checked) {
+      const unreturnedIds = rentals
+        .filter(r => !r.returned)
+        .map(r => r.id);
+      setSelectedRentals(unreturnedIds);
+    } else {
+      setSelectedRentals([]);
+    }
+  }, [rentals]);
+
+  // Handle bulk actions (return or delete selected rentals)
+  const handleBulkAction = useCallback(async () => {
+    if (selectedRentals.length === 0) {
+      setError('⚠️ No rentals selected.');
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('accessToken');
+      if (!token) {
+        setError('⚠️ No access token found. Please log in.');
+        return;
+      }
+
+      setBulkLoading(true);
+      if (bulkAction === 'return') {
+        if (!hasReturnPermission) {
+          setError('⚠️ No return permission.');
+          return;
+        }
+        for (const id of selectedRentals) {
+          const rental = rentals.find(r => r.id === id);
+          if (!rental.returned) {
+            await API.post(`rentals/rentals/${id}/mark_returned/`, {}, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+          }
+        }
+        setSuccess(`✅ ${selectedRentals.length} rental(s) marked as returned.`);
+      } else if (bulkAction === 'delete') {
+        if (!hasDeletePermission) {
+          setError('⚠️ No delete permission.');
+          return;
+        }
+        for (const id of selectedRentals) {
+          const rental = rentals.find(r => r.id === id);
+          if (rental && !rental.returned) {
+            setError(`⚠️ Cannot delete unreturned rental ID ${id}. Please mark as returned first.`);
+            continue;
+          }
+          await API.delete(`rentals/rentals/${id}/`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        }
+        setSuccess(`✅ ${selectedRentals.length} rental(s) deleted successfully.`);
+      }
+
+      await Promise.all([fetchRentals(), fetchEquipment(), fetchNotifications()]);
+      setSelectedRentals([]);
+      setOpenBulkDialog(false);
+    } catch (err) {
+      let errorMsg = `${bulkAction === 'return' ? 'Return' : 'Delete'} failed.`;
+      if (err.response?.data) {
+        errorMsg = Object.entries(err.response.data)
+          .map(([field, msg]) => `${field}: ${Array.isArray(msg) ? msg.join(', ') : msg}`)
+          .join('; ');
+      }
+      setError(`❌ ${errorMsg}`);
+    } finally {
+      setBulkLoading(false);
+    }
+  }, [selectedRentals, bulkAction, hasReturnPermission, hasDeletePermission, rentals, fetchRentals, fetchEquipment, fetchNotifications]);
+
+  useEffect(() => {
+    const checkPermissions = async () => {
+      try {
+        const token = localStorage.getItem('accessToken');
+        if (!token) {
+          setError('⚠️ No access token found. Please log in.');
+          setCheckingPermissions(false);
+          return;
+        }
+
+        const [
+          pageRes, 
+          createRes, 
+          updateRes, 
+          deleteRes, 
+          returnRes, 
+          extendRes, 
+          createPaymentRes,
+          resPageRes, 
+          resCreateRes, 
+          resUpdateRes, 
+          resDeleteRes
+        ] = await Promise.all([
+          API.get('/auth/permissions/page/rentals_active/', { headers: { Authorization: `Bearer ${token}` } }),
+          API.get('/auth/permissions/action/create_rental/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/update_rental/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/delete_rental/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/mark_rental_returned/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/extend_rental/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/create_payment/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/page/rentals_active/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/create_reservation/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/update_reservation/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } })),
+          API.get('/auth/permissions/action/delete_reservation/', { headers: { Authorization: `Bearer ${token}` } }).catch(() => ({ data: { allowed: false } }))
+        ]);
+
+        setHasPermission(pageRes.data.allowed);
+        setHasCreatePermission(createRes.data.allowed);
+        setHasUpdatePermission(updateRes.data.allowed);
+        setHasDeletePermission(deleteRes.data.allowed);
+        setHasReturnPermission(returnRes.data.allowed);
+        setHasExtendPermission(extendRes.data.allowed);
+        setHasCreatePaymentPermission(createPaymentRes.data.allowed);
+        setHasReservationPermission(resPageRes.data.allowed);
+        setHasCreateReservationPermission(resCreateRes.data.allowed);
+        setHasUpdateReservationPermission(resUpdateRes.data.allowed);
+        setHasDeleteReservationPermission(resDeleteRes.data.allowed);
+
+        if (pageRes.data.allowed) {
+          await Promise.all([fetchRentals(), fetchEquipment(), fetchNotifications()]);
+          if (createRes.data.allowed || resCreateRes.data.allowed) {
+            await fetchUsers();
+          }
+        }
+        if (resPageRes.data.allowed) {
+          await fetchReservations();
+        }
+      } catch (err) {
+        setError(`⚠️ Permission check failed: ${err.response?.data?.detail || err.message}`);
+      } finally {
+        setCheckingPermissions(false);
+      }
+    };
+    checkPermissions();
+  }, [fetchRentals, fetchReservations, fetchEquipment, fetchUsers, fetchNotifications]);
+
+  const allSelected = useMemo(() => {
+    const unreturnedCount = rentals.filter(r => !r.returned).length;
+    return unreturnedCount > 0 && selectedRentals.length === unreturnedCount;
+  }, [selectedRentals, rentals]);
+
+  if (checkingPermissions) {
+    return (
+      <Container>
+        <Box display="flex" justifyContent="center" alignItems="center" minHeight="50vh">
+          <CircularProgress />
+          <Typography variant="h6" ml={2}>Loading...</Typography>
+        </Box>
+      </Container>
+    );
+  }
+
+  if (!hasPermission && !hasReservationPermission) {
+    return (
+      <Container>
+        <Alert severity="error">You do not have permission to view this page.</Alert>
+      </Container>
+    );
+  }
+
+  return (
+    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+      {error && <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>{error}</Alert>}
+      {success && <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess('')}>{success}</Alert>}
+
+      <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+        <Typography variant="h4">Rentals & Reservations</Typography>
+        <Box>
+          {notifications.length > 0 && (
+            <Button
+              variant="outlined"
+              color="warning"
+              startIcon={<NotificationsIcon />}
+              onClick={handleNotificationsOpen}
+              sx={{ mr: 1 }}
+            >
+              Notifications ({notifications.length})
+            </Button>
+          )}
+          <Button
+            variant="outlined"
+            startIcon={<PictureAsPdfIcon />}
+            onClick={handleDownloadEquipmentReport}
+            disabled={actionLoading.equipmentReport}
+          >
+            {actionLoading.equipmentReport ? 'Downloading...' : 'Equipment Report (PDF)'}
+          </Button>
+        </Box>
+      </Box>
+
+      {/* === Reservations Accordion === */}
+      {hasReservationPermission && (
+        <Accordion sx={{ mb: 3 }}>
+          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+            <Typography variant="h6">Manage Reservations</Typography>
+          </AccordionSummary>
+          <AccordionDetails>
+            <Box display="flex" justifyContent="space-between" mb={2}>
+              <Typography variant="body2" color="textSecondary">
+                Reserve equipment in advance to prevent double-booking
+              </Typography>
+              {hasCreateReservationPermission && (
+                <Button
+                  variant="outlined"
+                  startIcon={<AddIcon />}
+                  onClick={() => handleOpenReservationDialog()}
+                >
+                  Add Reservation
+                </Button>
+              )}
+            </Box>
+
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell />
+                  <TableCell><strong>Equipment</strong></TableCell>
+                  <TableCell><strong>Start Date</strong></TableCell>
+                  <TableCell><strong>End Date</strong></TableCell>
+                  <TableCell><strong>Quantity</strong></TableCell>
+                  <TableCell><strong>Actions</strong></TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {reservations.length > 0 ? (
+                  reservations.map(reservation => (
+                    <ReservationRow
+                      key={reservation.id}
+                      reservation={reservation}
+                      onEdit={handleOpenReservationDialog}
+                      onDelete={handleReservationDeleteOpen}
+                      hasUpdatePermission={hasUpdateReservationPermission}
+                      hasDeletePermission={hasDeleteReservationPermission}
+                      isLoading={actionLoading[`deleteReservation_${reservation.id}`] || false}
+                    />
+                  ))
+                ) : (
+                  <TableRow>
+                    <TableCell colSpan={6} align="center">
+                      <Typography variant="body2" color="textSecondary">No reservations found.</Typography>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+
+            {reservationTotalPages > 1 && (
+              <Box display="flex" justifyContent="center" mt={2}>
+                <Pagination
+                  count={reservationTotalPages}
+                  page={reservationPage}
+                  onChange={(_, p) => setReservationPage(p)}
+                  color="primary"
+                />
+              </Box>
+            )}
+          </AccordionDetails>
+        </Accordion>
+      )}
+
+      {/* === Rentals Section === */}
+      <Accordion sx={{ mb: 2 }}>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Typography variant="h6">Rental Management Guide & Best Practices</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <Typography variant="body1" paragraph>
+            <strong>💡 What is Rental Management?</strong> This page tracks all active equipment rentals, including renter details, equipment, branch location, and return status. Click on any row to view complete details.
+          </Typography>
+          <Typography variant="body1" paragraph>
+            <strong>✅ Best Practices:</strong>
+            <ul>
+              <li><strong>Concurrent Rentals:</strong> Same equipment can be rented to multiple clients simultaneously.</li>
+              <li><strong>Open-Ended Rentals:</strong> Leave due date empty for ongoing rentals (billed daily).</li>
+              <li><strong>Real-Time Tracking:</strong> Duration updates automatically for open-ended rentals.</li>
+              <li><strong>Bulk Actions:</strong> Select multiple rentals to return or delete at once.</li>
+              <li><strong>Overdue Handling:</strong> Overdue rentals are highlighted with warning icons.</li>
+              <li><strong>Notifications:</strong> Check notifications for overdue rentals and other alerts.</li>
+            </ul>
+          </Typography>
+        </AccordionDetails>
+      </Accordion>
+
+      <Box mb={2} display="flex" gap={2}>
+        {hasCreatePermission && (
+          <Button variant="contained" startIcon={<AddIcon />} onClick={() => handleOpenDialog()}>
+            Add Rental
+          </Button>
+        )}
+        {selectedRentals.length > 0 && (
+          <>
+            <Button 
+              variant="outlined" 
+              color="success" 
+              onClick={() => handleBulkOpen('return')}
+              disabled={!hasReturnPermission}
+            >
+              Return Selected ({selectedRentals.length})
+            </Button>
+            <Button 
+              variant="outlined" 
+              color="error" 
+              onClick={() => handleBulkOpen('delete')}
+              disabled={!hasDeletePermission}
+            >
+              Delete Selected ({selectedRentals.length})
+            </Button>
+          </>
+        )}
+      </Box>
+
+      <Paper sx={{ p: 3 }}>
+        <Typography variant="body2" color="textSecondary" sx={{ mb: 2 }}>
+          💡 Click on any row to view complete details including payment history and financial summary
+        </Typography>
+        <Table>
+          <TableHead>
+            <TableRow>
+              <TableCell padding="checkbox">
+                <Checkbox
+                  indeterminate={selectedRentals.length > 0 && !allSelected}
+                  checked={allSelected}
+                  onChange={handleSelectAll}
+                />
+              </TableCell>
+              <TableCell />
+              <TableCell><strong>Code</strong></TableCell>
+              <TableCell><strong>Renter</strong></TableCell>
+              <TableCell><strong>Equipment</strong></TableCell>
+              <TableCell><strong>Start Date</strong></TableCell>
+              <TableCell><strong>Due Date</strong></TableCell>
+              <TableCell><strong>Actions</strong></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {rentals.length > 0 ? (
+              rentals.map(rental => (
+                <RentalRow
+                  key={rental.id}
+                  rental={rental}
+                  onEdit={handleOpenDialog}
+                  onDelete={handleDeleteOpen}
+                  onMarkReturned={handleReturnOpen}
+                  onExtend={handleExtendOpen}
+                  hasUpdatePermission={hasUpdatePermission}
+                  hasDeletePermission={hasDeletePermission}
+                  hasReturnPermission={hasReturnPermission}
+                  hasExtendPermission={hasExtendPermission}
+                  onSelect={handleSelectRental}
+                  selected={selectedRentals.includes(rental.id)}
+                  onDownloadReceipt={handleDownloadReceipt}
+                  onAddPayment={handleOpenPaymentDialog}
+                  isLoading={
+                    actionLoading[`delete_${rental.id}`] ||
+                    actionLoading[`return_${rental.id}`] ||
+                    actionLoading[`extend_${rental.id}`] ||
+                    actionLoading[`receipt_${rental.id}`] ||
+                    false
+                  }
+                />
+              ))
+            ) : (
+              <TableRow>
+                <TableCell colSpan={8} align="center">
+                  <Typography variant="body2" color="textSecondary">No rentals found.</Typography>
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+
+        {totalPages > 1 && (
+          <Box mt={3} display="flex" justifyContent="center">
+            <Pagination count={totalPages} page={page} onChange={(_, p) => setPage(p)} color="primary" />
+          </Box>
+        )}
+      </Paper>
+
+      {/* === Rental Form Dialog === */}
+      <Dialog open={openDialog} onClose={handleCloseDialog} maxWidth="sm" fullWidth>
+        <DialogTitle>{editId ? '✏️ Edit Rental' : '➕ Add New Rental'}</DialogTitle>
+        <DialogContent>
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            <Grid item xs={12}>
+              <FormControl fullWidth required error={!formData.equipment}>
+                <InputLabel>Equipment</InputLabel>
+                <Select name="equipment" value={formData.equipment} onChange={handleChange}>
+                  <MenuItem value="">Select Equipment</MenuItem>
+                  {equipmentList.map(eq => (
+                    <MenuItem 
+                      key={eq.id} 
+                      value={eq.id}
+                      disabled={eq.available_quantity <= 0}
+                    >
+                      {eq.name} ({eq.branch_name || 'No Branch'}) 
+                      {eq.available_quantity <= 0 ? ' (Unavailable)' : ` (Avail: ${eq.available_quantity})`}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12}>
+              <FormControl fullWidth required error={!formData.renter}>
+                <InputLabel>Renter</InputLabel>
+                <Select name="renter" value={formData.renter} onChange={handleChange}>
+                  <MenuItem value="">Select Renter</MenuItem>
+                  {usersList.map(user => (
+                    <MenuItem key={user.id} value={user.id}>
+                      {user.full_name || user.email}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField 
+                label="Start Date" 
+                name="start_date" 
+                type="date" 
+                value={formData.start_date} 
+                onChange={handleChange} 
+                fullWidth 
+                required 
+                error={!formData.start_date}
+                InputLabelProps={{ shrink: true }} 
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField 
+                label="Due Date" 
+                name="due_date" 
+                type="date" 
+                value={formData.due_date} 
+                onChange={handleChange} 
+                fullWidth 
+                disabled={formData.is_open_ended}
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    name="is_open_ended"
+                    checked={formData.is_open_ended}
+                    onChange={handleChange}
+                  />
+                }
+                label="Open-ended rental (no due date)"
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Quantity"
+                name="quantity"
+                type="number"
+                value={formData.quantity}
+                onChange={handleChange}
+                fullWidth
+                required
+                error={parseInt(formData.quantity) <= 0}
+                helperText={parseInt(formData.quantity) <= 0 ? 'Must be at least 1' : ''}
+                inputProps={{ min: 1 }}
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <FormControl fullWidth>
+                <InputLabel>Currency</InputLabel>
+                <Select name="currency" value={formData.currency} onChange={handleChange}>
+                  {CURRENCY_OPTIONS.map(opt => (
+                    <MenuItem key={opt.value} value={opt.value}>{opt.label}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Rental Rate (per day)"
+                name="rental_rate"
+                type="number"
+                value={formData.rental_rate}
+                onChange={handleChange}
+                fullWidth
+                placeholder="Daily rate"
+                inputProps={{ min: 0, step: '0.01' }}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                label="Notes"
+                name="notes"
+                multiline
+                rows={2}
+                value={formData.notes}
+                onChange={handleChange}
+                fullWidth
+                placeholder="Special instructions, project name, etc."
+              />
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseDialog} disabled={actionLoading.saveRental}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            onClick={handleSave} 
+            disabled={actionLoading.saveRental}
+          >
+            {actionLoading.saveRental ? <CircularProgress size={24} /> : 'Save'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* === Reservation Form Dialog === */}
+      <Dialog open={openReservationDialog} onClose={handleCloseReservationDialog} maxWidth="sm" fullWidth>
+        <DialogTitle>{reservationEditId ? '✏️ Edit Reservation' : '➕ Add New Reservation'}</DialogTitle>
+        <DialogContent>
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            <Grid item xs={12}>
+              <FormControl fullWidth required error={!reservationForm.equipment}>
+                <InputLabel>Equipment</InputLabel>
+                <Select name="equipment" value={reservationForm.equipment} onChange={handleReservationChange}>
+                  <MenuItem value="">Select Equipment</MenuItem>
+                  {equipmentList.map(eq => (
+                    <MenuItem 
+                      key={eq.id} 
+                      value={eq.id}
+                      disabled={eq.available_quantity <= 0}
+                    >
+                      {eq.name} ({eq.branch_name || 'No Branch'}) 
+                      {eq.available_quantity <= 0 ? ' (Unavailable)' : ` (Avail: ${eq.available_quantity})`}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField 
+                label="Start Date" 
+                name="start_date" 
+                type="date" 
+                value={reservationForm.start_date} 
+                onChange={handleReservationChange} 
+                fullWidth 
+                required 
+                error={!reservationForm.start_date}
+                InputLabelProps={{ shrink: true }} 
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField 
+                label="End Date" 
+                name="end_date" 
+                type="date" 
+                value={reservationForm.end_date} 
+                onChange={handleReservationChange} 
+                fullWidth 
+                disabled={reservationForm.is_open_ended}
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    name="is_open_ended"
+                    checked={reservationForm.is_open_ended}
+                    onChange={handleReservationChange}
+                  />
+                }
+                label="Open-ended reservation (no end date)"
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                label="Quantity"
+                name="quantity"
+                type="number"
+                value={reservationForm.quantity}
+                onChange={handleReservationChange}
+                fullWidth
+                required
+                error={parseInt(reservationForm.quantity) <= 0}
+                helperText={parseInt(reservationForm.quantity) <= 0 ? 'Must be at least 1' : ''}
+                inputProps={{ min: 1 }}
+              />
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCloseReservationDialog} disabled={actionLoading.saveReservation}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            onClick={handleSaveReservation} 
+            disabled={actionLoading.saveReservation}
+          >
+            {actionLoading.saveReservation ? <CircularProgress size={24} /> : 'Save'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* === Payment Form Dialog === */}
+      <Dialog open={openPaymentDialog} onClose={handleClosePaymentDialog} maxWidth="sm" fullWidth>
+        <DialogTitle>➕ Add Payment</DialogTitle>
+        <DialogContent>
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            <Grid item xs={12}>
+              <TextField
+                label="Amount Paid"
+                name="amount_paid"
+                type="number"
+                value={paymentForm.amount_paid}
+                onChange={handlePaymentChange}
+                fullWidth
+                required
+                error={!paymentForm.amount_paid || parseFloat(paymentForm.amount_paid) <= 0}
+                helperText={
+                  !paymentForm.amount_paid 
+                    ? 'Amount is required' 
+                    : parseFloat(paymentForm.amount_paid) <= 0 
+                      ? 'Must be positive' 
+                      : ''
+                }
+                inputProps={{ min: 0.01, step: '0.01' }}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                label="Amount in Words"
+                name="amount_in_words"
+                value={paymentForm.amount_in_words}
+                onChange={handlePaymentChange}
+                fullWidth
+                required
+                error={!paymentForm.amount_in_words}
+                helperText={!paymentForm.amount_in_words ? 'Required' : ''}
+                placeholder="e.g., One Thousand Naira Only"
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <FormControl fullWidth>
+                <InputLabel>Status</InputLabel>
+                <Select name="status" value={paymentForm.status} onChange={handlePaymentChange}>
+                  <MenuItem value="Paid">Paid</MenuItem>
+                  <MenuItem value="Pending">Pending</MenuItem>
+                </Select>
+              </FormControl>
+            </Grid>
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleClosePaymentDialog} disabled={actionLoading.savePayment}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            onClick={handleSavePayment} 
+            disabled={actionLoading.savePayment}
+          >
+            {actionLoading.savePayment ? <CircularProgress size={24} /> : 'Save Payment'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* === Notifications Dialog === */}
+      <Dialog open={openNotificationsDialog} onClose={handleNotificationsClose} maxWidth="sm" fullWidth>
+        <DialogTitle>Notifications ({notifications.length})</DialogTitle>
+        <DialogContent>
+          {notifications.length > 0 ? (
+            <Box>
+              {notifications.map(notification => (
+                <Alert
+                  key={notification.id}
+                  severity={notification.severity.toLowerCase()}
+                  sx={{ mb: 1 }}
+                >
+                  <Typography variant="subtitle2">{notification.title}</Typography>
+                  <Typography variant="body2">{notification.message}</Typography>
+                  <Typography variant="caption">
+                    {dayjs(notification.created_at).format('DD/MM/YYYY HH:mm')}
+                  </Typography>
+                </Alert>
+              ))}
+            </Box>
+          ) : (
+            <Typography variant="body2" color="textSecondary">No notifications.</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleNotificationsClose} disabled={actionLoading.markNotifications}>Cancel</Button>
+          {notifications.length > 0 && (
+            <Button 
+              variant="contained" 
+              onClick={handleMarkNotificationsRead}
+              disabled={actionLoading.markNotifications}
+            >
+              {actionLoading.markNotifications ? <CircularProgress size={24} /> : 'Mark All as Read'}
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
+
+      {/* === Delete Dialogs === */}
+      <Dialog open={openDeleteDialog} onClose={handleDeleteClose}>
+        <DialogTitle>Delete Rental?</DialogTitle>
+        <DialogContent>
+          <Typography>Are you sure? This cannot be undone.</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleDeleteClose} disabled={actionLoading[`delete_${deleteId}`]}>Cancel</Button>
+          <Button 
+            color="error" 
+            onClick={handleDelete} 
+            disabled={actionLoading[`delete_${deleteId}`]}
+          >
+            {actionLoading[`delete_${deleteId}`] ? <CircularProgress size={24} /> : 'Delete'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={openReservationDeleteDialog} onClose={handleReservationDeleteClose}>
+        <DialogTitle>Delete Reservation?</DialogTitle>
+        <DialogContent>
+          <Typography>Are you sure? This cannot be undone.</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button 
+            onClick={handleReservationDeleteClose} 
+            disabled={actionLoading[`deleteReservation_${reservationDeleteId}`]}
+          >
+            Cancel
+          </Button>
+          <Button 
+            color="error" 
+            onClick={handleDeleteReservation}
+            disabled={actionLoading[`deleteReservation_${reservationDeleteId}`]}
+          >
+            {actionLoading[`deleteReservation_${reservationDeleteId}`] ? <CircularProgress size={24} /> : 'Delete'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* === Return Dialog === */}
+      <Dialog open={openReturnDialog} onClose={handleReturnClose}>
+        <DialogTitle>Mark as Returned?</DialogTitle>
+        <DialogContent>
+          <Typography>Confirm that the equipment has been returned. This will update stock availability and stop billing.</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleReturnClose} disabled={actionLoading[`return_${returnId}`]}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            color="success" 
+            onClick={handleMarkReturned}
+            disabled={actionLoading[`return_${returnId}`]}
+          >
+            {actionLoading[`return_${returnId}`] ? <CircularProgress size={24} /> : 'Confirm Return'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* === Extend Dialog === */}
+      <Dialog open={openExtendDialog} onClose={handleExtendClose}>
+        <DialogTitle>Extend Rental</DialogTitle>
+        <DialogContent>
+          <TextField
+            label="New Due Date"
+            type="date"
+            fullWidth
+            value={extendRental?.new_due_date || ''}
+            onChange={(e) => setExtendRental(prev => ({ ...prev, new_due_date: e.target.value }))}
+            InputLabelProps={{ shrink: true }}
+            required
+            error={!extendRental?.new_due_date}
+            helperText={!extendRental?.new_due_date ? 'Required' : ''}
+          />
+          <Typography variant="body2" color="textSecondary" sx={{ mt: 1 }}>
+            Current due date: {extendRental?.effective_due_date ? dayjs(extendRental.effective_due_date).format('DD/MM/YYYY') : 'N/A'}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleExtendClose} disabled={actionLoading[`extend_${extendRental?.id}`]}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            onClick={handleExtendRental}
+            disabled={actionLoading[`extend_${extendRental?.id}`]}
+          >
+            {actionLoading[`extend_${extendRental?.id}`] ? <CircularProgress size={24} /> : 'Extend'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* === Bulk Action Dialog === */}
+      <Dialog open={openBulkDialog} onClose={handleBulkClose}>
+        <DialogTitle>
+          {bulkAction === 'return' ? 'Return Selected Rentals?' : 'Delete Selected Rentals?'}
+        </DialogTitle>
+        <DialogContent>
+          <Typography>
+            Are you sure you want to {bulkAction} {selectedRentals.length} rental(s)? This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleBulkClose} disabled={bulkLoading}>Cancel</Button>
+          <Button 
+            variant="contained" 
+            color={bulkAction === 'return' ? 'success' : 'error'} 
+            onClick={handleBulkAction}
+            disabled={bulkLoading}
+          >
+            {bulkLoading ? <CircularProgress size={24} /> : (bulkAction === 'return' ? 'Return' : 'Delete')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Container>
+  );
+}

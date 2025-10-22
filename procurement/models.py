@@ -172,7 +172,8 @@ class PurchaseOrder(models.Model):
         ('cancelled', 'Cancelled'),
     ]
     
-    code = models.CharField(max_length=100, unique=True, blank=True)
+    code = models.CharField(max_length=100, unique=True, blank=True, null=True)
+    order_number = models.CharField(max_length=100, blank=True, null=True, help_text="Manual order number (optional)")  # ← ADD THIS
     requisition = models.ForeignKey(Requisition, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_orders')
     vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='purchase_orders')
     department = models.CharField(max_length=100)
@@ -181,14 +182,33 @@ class PurchaseOrder(models.Model):
     payment_terms = models.TextField(blank=True)
     notes = models.TextField(blank=True)
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='draft')
-    total_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0)
-    tax_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0)
-    discount_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0, null=True, blank=True)
+    tax_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0, null=True, blank=True)
+    discount_amount = models.DecimalField(max_digits=20, decimal_places=2, default=0, null=True, blank=True)
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='purchase_orders')
     approved_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_pos')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     approved_at = models.DateTimeField(null=True, blank=True)
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
+    use_inclusive_pricing = models.BooleanField(default=False, null=True, blank=True)
+    layout = models.CharField(
+        max_length=50,
+        default="default",
+        help_text="Template layout for printing (e.g., 'classic', 'detailed')", null=True, blank=True
+    )
+
+    def _recalculate_totals(self):
+        items = self.items.all()
+        subtotal = sum(item.get_subtotal() for item in items)
+        total_vat = sum(item.get_vat_amount() for item in items)
+        total_discount = sum(item.get_discount_amount() for item in items)
+        
+        # Apply global discount
+        global_discount = subtotal * (self.discount_percent / 100)
+        discounted_subtotal = subtotal - global_discount
+        
+        self.total_amount = discounted_subtotal + total_vat
 
     class Meta:
         ordering = ['-created_at']
@@ -245,6 +265,8 @@ class POItem(models.Model):
     notes = models.TextField(blank=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='po_items')
     created_at = models.DateTimeField(auto_now_add=True)
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)  # e.g., 7.5 for 7.5%
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
 
     class Meta:
         ordering = ['id']
@@ -252,9 +274,6 @@ class POItem(models.Model):
     def __str__(self):
         return f"{self.item.name} x {self.quantity} @ {self.unit_price}"
 
-    def save(self, *args, **kwargs):
-        self.total_price = self.unit_price * self.quantity
-        super().save(*args, **kwargs)
 
     def clean(self):
         if self.quantity <= 0:
@@ -263,6 +282,25 @@ class POItem(models.Model):
             raise ValidationError("Unit price must be positive.")
         if self.received_quantity > self.quantity:
             raise ValidationError("Received quantity cannot exceed ordered quantity.")
+
+    def get_subtotal(self):
+        return self.unit_price * self.quantity
+
+    def get_discount_amount(self):
+        return self.get_subtotal() * (self.discount_percent / 100)
+
+    def get_net_amount(self):
+        return self.get_subtotal() - self.get_discount_amount()
+
+    def get_vat_amount(self):
+        return self.get_net_amount() * (self.vat_rate / 100)
+
+    def get_total(self):
+        return self.get_net_amount() + self.get_vat_amount()
+
+    def save(self, *args, **kwargs):
+        self.total_price = self.unit_price * self.quantity
+        super().save(*args, **kwargs)
 
 class Receiving(models.Model):
     STATUS_CHOICES = [
@@ -361,7 +399,7 @@ class ReceivingItem(models.Model):
             stock_record, created = StockRecord.objects.get_or_create(
                 item=self.po_item.item,
                 storage_bin=self.storage_bin,
-                defaults={'quantity': 0, 'user': self.created_by or self.receiving.created_by}
+                defaults={'quantity': 0, 'user': self.receiving.created_by}
             )
             stock_record.quantity += self.accepted_quantity
             stock_record.save()

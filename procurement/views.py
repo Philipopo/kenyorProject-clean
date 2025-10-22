@@ -537,128 +537,257 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def export_pdf(self, request, pk=None):
-        """Export Purchase Order as PDF using reportlab (no Cairo or xhtml2pdf needed)"""
+        """Export Purchase Order as PDF with Kenyon-branded styling"""
         po = self.get_object()
-        
-        # Create a bytes buffer for the PDF
+
         buffer = BytesIO()
         doc = SimpleDocTemplate(
             buffer,
             pagesize=letter,
-            topMargin=0.5 * inch,
-            bottomMargin=0.5 * inch,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
             leftMargin=0.75 * inch,
             rightMargin=0.75 * inch
         )
         elements = []
-        
         styles = getSampleStyleSheet()
+
+        # --- Custom styles ---
         title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=16,
-            spaceAfter=12,
-            alignment=1  # center
+            'ReceiptTitle', parent=styles['Heading1'],
+            fontSize=16, alignment=1, spaceAfter=8, leading=20,
+            textColor=colors.HexColor("#333333")
         )
-        normal_style = styles['Normal']
-        
-        # === Company Information ===
-        company_name = getattr(settings, 'COMPANY_NAME', 'Your Company')
-        company_address = getattr(settings, 'COMPANY_ADDRESS', '')
-        company_phone = getattr(settings, 'COMPANY_PHONE', '')
-        company_email = getattr(settings, 'COMPANY_EMAIL', '')
-        
-        elements.append(Paragraph(company_name, title_style))
-        if company_address:
-            elements.append(Paragraph(company_address, normal_style))
-        if company_phone:
-            elements.append(Paragraph(f"Phone: {company_phone}", normal_style))
-        if company_email:
-            elements.append(Paragraph(f"Email: {company_email}", normal_style))
-        elements.append(Spacer(1, 14))
-        
-        # === Purchase Order Header ===
-        elements.append(Paragraph(f"Purchase Order #{po.code}", 
-                                 ParagraphStyle('POHeader', parent=styles['Heading2'], fontSize=14)))
-        elements.append(Spacer(1, 12))
-        
-        # === PO Details Table ===
-        po_data = [
-            ["Date:", po.created_at.strftime('%Y-%m-%d')],
-            ["Department:", po.department or "N/A"],
-            ["Vendor:", po.vendor.name if po.vendor else "N/A"],
-            ["Status:", po.get_status_display()],
+        section_heading = ParagraphStyle(
+            'SectionHeading', parent=styles['Heading3'],
+            fontSize=10.5, spaceBefore=6, spaceAfter=6,
+            textColor=colors.HexColor("#2b2b2b"), leading=13
+        )
+        small_info = ParagraphStyle(
+            'SmallInfo', parent=styles['Normal'],
+            fontSize=9, leading=12, textColor=colors.black
+        )
+
+        # === Header Section ===
+        if hasattr(settings, 'COMPANY_LOGO_PATH'):
+            try:
+                from reportlab.platypus import Image
+                logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.5*inch, height=0.8*inch)
+
+                header_table = Table([[
+                    logo_img,
+                    Paragraph(
+                        f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/>"
+                        f"<span>{getattr(settings, 'COMPANY_ADDRESS', '')}</span>",
+                        styles['Title']
+                    ),
+                    Paragraph(
+                        f"<b>PO No.</b><br/>{po.code or '—'}<br/><br/>"
+                        f"<b>Date</b><br/>{po.created_at.strftime('%d/%m/%Y')}",
+                        small_info
+                    )
+                ]], colWidths=[1.5*inch, 3.8*inch, 2.2*inch])
+
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+            except Exception as e:
+                logger.warning(f"Logo not found: {str(e)}")
+                # Fallback without logo
+                header_table = Table([[
+                    Paragraph(
+                        f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/>"
+                        f"<span>{getattr(settings, 'COMPANY_ADDRESS', '')}</span>",
+                        styles['Title']
+                    ),
+                    Paragraph(
+                        f"<b>PO No.</b><br/>{po.code or '—'}<br/><br/>"
+                        f"<b>Date</b><br/>{po.created_at.strftime('%d/%m/%Y')}",
+                        small_info
+                    )
+                ]], colWidths=[5.0*inch, 2.2*inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+        else:
+            # No logo path defined
+            header_table = Table([[
+                Paragraph(
+                    f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/>"
+                    f"<span>{getattr(settings, 'COMPANY_ADDRESS', '')}</span>",
+                    styles['Title']
+                ),
+                Paragraph(
+                    f"<b>PO No.</b><br/>{po.code or '—'}<br/><br/>"
+                    f"<b>Date</b><br/>{po.created_at.strftime('%d/%m/%Y')}",
+                    small_info
+                )
+            ]], colWidths=[5.0*inch, 2.2*inch])
+            header_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+            ]))
+            elements.append(header_table)
+            elements.append(Spacer(1, 12))
+
+        # === Main Title ===
+        elements.append(Paragraph("PURCHASE ORDER", title_style))
+        elements.append(Spacer(1, 8))
+
+        # === Supplier Details ===
+        elements.append(Paragraph("<b>SUPPLIER DETAILS</b>", section_heading))
+        elements.append(Spacer(1, 6))
+        supplier_data = [
+            ["Supplier", po.vendor.name if po.vendor else "—"],
+            ["VAT Reference", po.vendor.tax_id or "—"],
+            ["Physical Address", po.vendor.address or "—"],
+            ["Contact", f"{po.vendor.contact_person or '—'} | {po.vendor.phone or '—'}"],
         ]
-        if po.approved_at:
-            po_data.append(["Approved At:", po.approved_at.strftime('%Y-%m-%d')])
-        
-        po_table = Table(po_data, colWidths=[1.8 * inch, 4.0 * inch])
-        po_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
+        supplier_table = Table(supplier_data, colWidths=[2.0*inch, 4.1*inch])
+        supplier_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(supplier_table)
+        elements.append(Spacer(1, 12))
+
+        # === PO Details ===
+        elements.append(Paragraph("<b>PURCHASE ORDER DETAILS</b>", section_heading))
+        elements.append(Spacer(1, 6))
+        po_details = [
+            ["PO Number", po.code or "—"],
+            ["Department", po.department or "—"],
+            ["Delivery Address", po.delivery_address or "—"],
+            ["Expected Delivery", po.expected_delivery_date.strftime('%d/%m/%Y') if po.expected_delivery_date else "—"],
+            ["Payment Terms", po.payment_terms or "—"],
+            ["Status", po.get_status_display() or "—"],
+        ]
+        po_table = Table(po_details, colWidths=[2.0*inch, 4.1*inch])
+        po_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ]))
         elements.append(po_table)
-        elements.append(Spacer(1, 18))
-        
-        # === Items Section ===
-        elements.append(Paragraph("Items", ParagraphStyle('ItemsHeader', parent=styles['Heading3'])))
+        elements.append(Spacer(1, 12))
+
+        # === Items Table ===
+        elements.append(Paragraph("<b>ITEMS</b>", section_heading))
         elements.append(Spacer(1, 6))
-        
-        # Table header
-        item_data = [["Item", "Description", "Qty", "Unit Price", "Total"]]
-        
-        # Add each PO item
+
+        item_headers = ["Item", "Description", "Qty", "Unit Price (₦)", "Total (₦)"]
+        item_data = [item_headers]
+
+        total_amount = 0
         for item in po.items.all():
             total = item.quantity * item.unit_price
+            total_amount += total
             item_data.append([
-                item.item.name if item.item else "N/A",
-                getattr(item, 'description', "") or "",
+                item.item.name if item.item else "—",
+                getattr(item, 'notes', '') or "—",
                 str(item.quantity),
                 f"{item.unit_price:.2f}",
                 f"{total:.2f}"
             ])
-        
+
         # Add total row
-        total_amount = sum(item.quantity * item.unit_price for item in po.items.all())
-        item_data.append(["", "", "", "Total:", f"{total_amount:.2f}"])
-        
-        # Create and style items table
-        item_table = Table(
-            item_data,
-            colWidths=[1.2 * inch, 2.3 * inch, 0.6 * inch, 0.8 * inch, 0.8 * inch]
-        )
+        item_data.append(["", "", "", "TOTAL:", f"{total_amount:.2f}"])
+
+        item_table = Table(item_data, colWidths=[1.2*inch, 2.0*inch, 0.8*inch, 1.0*inch, 1.1*inch])
         item_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('ALIGN', (-2, 1), (-1, -1), 'RIGHT'),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#E0E0E0")),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('GRID', (0, 0), (-1, -2), 0.5, colors.grey),
+            ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -2), 0.35, colors.HexColor("#D0D0D0")),
             ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
             ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-            ('TOPPADDING', (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#F6F6F6")),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ]))
         elements.append(item_table)
-        elements.append(Spacer(1, 24))
-        
-        # Optional: Add notes or footer
+        elements.append(Spacer(1, 12))
+
+        # === Message ===
         if po.notes:
-            elements.append(Paragraph("<b>Notes:</b>", ParagraphStyle('NotesHeader', parent=styles['Normal'], fontName='Helvetica-Bold')))
-            elements.append(Paragraph(po.notes, normal_style))
-        
+            elements.append(Paragraph("<b>MESSAGE</b>", section_heading))
+            elements.append(Spacer(1, 6))
+            elements.append(Paragraph(po.notes, styles['Normal']))
+            elements.append(Spacer(1, 12))
+
+        # === Footer ===
+        footer_table = Table([[
+            Paragraph("<i>This document is auto-generated. Signatures are required for validation.</i>", styles['Italic']),
+            Paragraph(f"{getattr(settings, 'COMPANY_NAME', '')}", small_info)
+        ]], colWidths=[4.6*inch, 2.0*inch])
+        footer_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#333333")),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.whitesmoke),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(footer_table)
+
         # Build PDF
         doc.build(elements)
-        
-        # Prepare HTTP response
+
+        # Filename
+        filename = f"PO_{po.code}_kenyon_receipt.pdf"
         buffer.seek(0)
         response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename="PO_{po.code}.pdf"'
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
+
+
 
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
@@ -792,7 +921,16 @@ class ReceivingViewSet(viewsets.ModelViewSet):
         #     object_id=instance_id,
         #     details={'deleted_receiving': instance_data}
         # )
+    def perform_create(self, serializer):
+        # Auto-set received_by and created_by from request user
+        instance = serializer.save(
+            received_by=self.request.user,
+            created_by=self.request.user
+        )
+        # Update PO status is already handled in model
 
+
+        
 class ProcurementAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ProcurementAuditLog.objects.all()
     serializer_class = ProcurementAuditLogSerializer

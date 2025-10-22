@@ -2,6 +2,7 @@ from django.db import models
 from django.conf import settings
 from django.core.exceptions import ValidationError
 import math
+from django.utils import timezone
 
 class DwellTime(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
@@ -10,6 +11,13 @@ class DwellTime(models.Model):
     is_aging = models.BooleanField(default=False)
     storage_cost = models.DecimalField(max_digits=10, decimal_places=2)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Dwell Time"
+        verbose_name_plural = "Dwell Times"
+
+    def __str__(self):
+        return f"Dwell for {self.item}: {self.duration_days} days"
 
 class EOQReport(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
@@ -21,11 +29,18 @@ class EOQReport(models.Model):
     eoq = models.PositiveIntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        verbose_name = "EOQ Report"
+        verbose_name_plural = "EOQ Reports"
+
+    def __str__(self):
+        return f"EOQ for {self.item} ({self.created_at})"
+
 class EOQReportV2(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='eoq_reports_v2')
     item = models.ForeignKey('inventory.Item', on_delete=models.CASCADE, related_name='eoq_reports_v2', help_text="Inventory item")
     demand_rate = models.PositiveIntegerField(help_text="Annual demand in units")
-    order_cost = models.DecimalField(max_digits=10, decimal_places=2, help_text="Cost per order")
+    ordering_cost = models.DecimalField(max_digits=10, decimal_places=2, help_text="Cost per order")  # Changed to ordering_cost
     holding_cost = models.DecimalField(max_digits=10, decimal_places=2, help_text="Holding cost per unit per year")
     lead_time_days = models.PositiveIntegerField(help_text="Lead time in days")
     safety_stock = models.PositiveIntegerField(default=0, help_text="Safety stock in units")
@@ -64,8 +79,8 @@ class EOQReportV2(models.Model):
     def clean(self):
         if self.demand_rate <= 0:
             raise ValidationError("Demand rate must be positive.")
-        if self.order_cost <= 0:
-            raise ValidationError("Order cost must be positive.")
+        if self.ordering_cost <= 0:  # Changed to ordering_cost
+            raise ValidationError("Ordering cost must be positive.")
         if self.holding_cost <= 0:
             raise ValidationError("Holding cost must be positive.")
         if self.lead_time_days < 0:
@@ -73,7 +88,7 @@ class EOQReportV2(models.Model):
 
         # Calculate EOQ: sqrt(2 * D * S / H)
         try:
-            eoq = math.sqrt((2 * self.demand_rate * float(self.order_cost)) / float(self.holding_cost))
+            eoq = math.sqrt((2 * self.demand_rate * float(self.ordering_cost)) / float(self.holding_cost))
             self.eoq = round(eoq)
         except (ValueError, ZeroDivisionError):
             raise ValidationError("Invalid values for EOQ calculation.")
@@ -83,12 +98,12 @@ class EOQReportV2(models.Model):
         self.reorder_point = round(demand_per_day * self.lead_time_days) + self.safety_stock
 
         # Calculate Total Cost: sqrt(2 * D * S * H)
-        self.total_cost = round(math.sqrt(2 * self.demand_rate * float(self.order_cost) * float(self.holding_cost)), 2)
+        self.total_cost = round(math.sqrt(2 * self.demand_rate * float(self.ordering_cost) * float(self.holding_cost)), 2)
 
         # Calculate Cost Breakdowns
         orders_per_year = self.demand_rate / self.eoq if self.eoq else 0
         self.holding_cost_breakdown = round((self.eoq / 2) * float(self.holding_cost), 2)
-        self.ordering_cost_breakdown = round(orders_per_year * float(self.order_cost), 2)
+        self.ordering_cost_breakdown = round(orders_per_year * float(self.ordering_cost), 2)
 
         # Calculate Inventory Turnover
         self.inventory_turnover = round(self.demand_rate / (self.eoq / 2), 2) if self.eoq else 0
@@ -108,6 +123,10 @@ class StockAnalytics(models.Model):
     turnover_rate = models.DecimalField(max_digits=10, decimal_places=2)
     obsolescence_risk = models.CharField(max_length=20)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Stock Analytics"
+        verbose_name_plural = "Stock Analytics"
 
     def __str__(self):
         return f"{self.item} - {self.category}"
@@ -138,6 +157,10 @@ class Supplier(models.Model):
     discount_threshold = models.PositiveIntegerField(blank=True, null=True, help_text="Quantity for discount")
     discount_percentage = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True, help_text="Discount percentage")
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Supplier"
+        verbose_name_plural = "Suppliers"
 
     def __str__(self):
         return self.name

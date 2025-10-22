@@ -1,0 +1,922 @@
+ models.py:
+# rentals/models.py
+
+from django.db import models
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+from alerts.models import Alert
+import logging
+from decimal import Decimal
+
+logger = logging.getLogger(__name__)
+
+CURRENCY_CHOICES = [
+    ('NGN', 'Nigerian Naira'),
+    ('USD', 'US Dollar'),
+]
+
+def rental_image_upload_path(instance, filename):
+    return f'rentals/equipment_{instance.id}/{filename}'
+
+class Branch(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    code = models.CharField(max_length=20, unique=True)
+    address = models.TextField()
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_branches'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+    def delete(self, *args, **kwargs):
+        if self.equipment.exists():
+            raise ValidationError("Cannot delete branch with assigned equipment.")
+        super().delete(*args, **kwargs)
+
+    class Meta:
+        ordering = ['name']
+
+
+class Equipment(models.Model):
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)  # ✅ NEW
+    image = models.ImageField(upload_to=rental_image_upload_path, blank=True, null=True)  # ✅ NEW
+    manufacture_date = models.DateField(null=True, blank=True)  # ✅ NEW
+    expiry_date = models.DateField(null=True, blank=True)  # ✅ NEW
+
+    category = models.CharField(max_length=100)
+    condition = models.CharField(max_length=50)
+    location = models.CharField(max_length=100)
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='equipment', null=True, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='equipment')
+    created_at = models.DateTimeField(auto_now_add=True)
+    total_quantity = models.PositiveIntegerField(default=1)
+    available_quantity = models.PositiveIntegerField(default=1)
+
+    def clean(self):
+        if self.available_quantity > self.total_quantity:
+            raise ValidationError("Available quantity cannot exceed total quantity.")
+        if self.available_quantity < 0:
+            raise ValidationError("Available quantity cannot be negative.")
+        if self.branch is None:
+            return
+        required_fields = ['name', 'category', 'condition', 'location']
+        for field in required_fields:
+            if not getattr(self, field):
+                raise ValidationError({field: "This field cannot be blank."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class Reservation(models.Model):  # ✅ NEW
+    equipment = models.ForeignKey(Equipment, on_delete=models.CASCADE, related_name='reservations')
+    reserved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reservations')
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)  # null = open-ended
+    quantity = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"Reservation for {self.equipment.name} by {self.reserved_by.email}"
+
+    def clean(self):
+        if self.end_date and self.start_date > self.end_date:
+            raise ValidationError("End date must be after start date.")
+        if self.quantity <= 0:
+            raise ValidationError("Reservation quantity must be positive.")
+        if self.quantity > self.equipment.available_quantity:
+            raise ValidationError(f"Only {self.equipment.available_quantity} units available for reservation.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class Rental(models.Model):
+    code = models.CharField(max_length=20, unique=True, editable=False)
+    renter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='rentals')
+    equipment = models.ForeignKey(Equipment, on_delete=models.CASCADE, related_name='rentals')
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='rentals', null=True, blank=True)
+    
+    start_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)  # null = open-ended
+    extended_to = models.DateField(null=True, blank=True)  # ✅ NEW for extension
+
+    rental_rate = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='NGN')
+    quantity = models.PositiveIntegerField(default=1)  # ✅ NEW: rent multiple units
+
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='approved_rentals'
+    )
+    returned = models.BooleanField(default=False)
+    returned_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='created_rentals')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def effective_due_date(self):
+        return self.extended_to or self.due_date
+
+    @property
+    def is_open_ended(self):
+        return self.due_date is None and self.extended_to is None
+
+    @property
+    def is_overdue(self):
+        if self.returned or self.is_open_ended:
+            return False
+        due = self.effective_due_date
+        return due and due < timezone.now().date()
+
+    @property
+    def days_overdue(self):
+        if self.is_overdue:
+            return (timezone.now().date() - self.effective_due_date).days
+        return 0
+
+    @property
+    def duration_days(self):
+        if not self.start_date:
+            return 0
+        end = self.returned_at.date() if self.returned and self.returned_at else timezone.now().date()
+        if self.is_open_ended:
+            return (end - self.start_date).days
+        due = self.effective_due_date
+        if due:
+            return min((end - self.start_date).days, (due - self.start_date).days)
+        return (end - self.start_date).days
+
+    @property
+    def total_rental_cost(self):
+        if not self.rental_rate:
+            return Decimal('0.00')
+        if self.is_open_ended:
+            # Cost up to today
+            days = self.duration_days
+        else:
+            days = (self.effective_due_date - self.start_date).days if self.effective_due_date else 0
+        return self.rental_rate * days * self.quantity
+
+    @property
+    def total_paid(self):
+        return self.payments.filter(status='Paid').aggregate(
+            total=models.Sum('amount_paid')
+        )['total'] or Decimal('0.00')
+
+    @property
+    def balance_due(self):
+        return max(self.total_rental_cost - self.total_paid, Decimal('0.00'))
+
+    def save(self, *args, **kwargs):
+        is_new = not self.pk
+        is_return_update = False
+
+        if not is_new:
+            old = Rental.objects.get(pk=self.pk)
+            is_return_update = (not old.returned) and self.returned
+
+        if is_new:
+            super().save(*args, **kwargs)
+            self.code = f"RENT-{self.id:06d}"
+            self.branch = self.equipment.branch
+            super().save(update_fields=['code', 'branch'])
+
+            # Check reservation conflict
+            active_res = Reservation.objects.filter(
+                equipment=self.equipment,
+                is_active=True,
+                start_date__lte=self.start_date,
+            ).filter(
+                models.Q(end_date__isnull=True) | models.Q(end_date__gte=self.start_date)
+            ).exists()
+            if active_res:
+                raise ValidationError("This equipment is currently reserved and cannot be rented.")
+
+            if self.quantity > self.equipment.available_quantity:
+                raise ValidationError(f"Only {self.equipment.available_quantity} units available.")
+
+            self.equipment.available_quantity -= self.quantity
+            self.equipment.save(update_fields=['available_quantity'])
+            self._check_overdue_alert()
+
+        elif is_return_update:
+            self.equipment.available_quantity = min(
+                self.equipment.available_quantity + self.quantity,
+                self.equipment.total_quantity
+            )
+            self.equipment.save(update_fields=['available_quantity'])
+            if not self.returned_at:
+                self.returned_at = timezone.now()
+            super().save(*args, **kwargs)
+
+        else:
+            super().save(*args, **kwargs)
+            self._check_overdue_alert()
+
+    def _check_overdue_alert(self):
+        if self.is_overdue and not self.returned:
+            existing = Alert.objects.filter(
+                user=self.renter,
+                message__contains=self.code,
+                type='Tracker Issue',
+            ).exists()
+            if not existing:
+                try:
+                    Alert.objects.create(
+                        user=self.renter,
+                        type='Tracker Issue',
+                        message=f"Rental {self.code} for {self.equipment.name} is overdue by {self.days_overdue} days.",
+                    )
+                    logger.warning(f"Overdue rental alert created for {self.code}")
+                except Exception as e:
+                    logger.error(f"Failed to create overdue alert for rental {self.code}: {e}")
+
+    def __str__(self):
+        return f"{self.code} - {self.renter.email} - {self.equipment.name} x{self.quantity}"
+
+
+class RentalPayment(models.Model):
+    rental = models.ForeignKey(Rental, on_delete=models.CASCADE, related_name='payments')
+    amount_paid = models.DecimalField(max_digits=10, decimal_places=2)
+    amount_in_words = models.CharField(max_length=255, blank=True)  # ✅ NEW
+    payment_date = models.DateField(auto_now_add=True)
+    status = models.CharField(max_length=20, choices=[('Paid', 'Paid'), ('Pending', 'Pending')])
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='rental_payments')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.rental.code} - {self.amount_paid} ({self.status})"
+
+
+# Optional: For clean receipt tracking
+class RentalReceipt(models.Model):
+    rental = models.OneToOneField(Rental, on_delete=models.CASCADE, related_name='receipt')
+    generated_at = models.DateTimeField(auto_now_add=True)
+    generated_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+
+    def __str__(self):
+        return f"Receipt for {self.rental.code}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+serializer.py:
+from rest_framework import serializers
+from .models import Equipment, Rental, RentalPayment, Branch, Reservation
+from django.contrib.auth import get_user_model
+from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
+# Helper: number to words (simple version)
+def number_to_words(n):
+    # Simplified; use `num2words` in production
+    if n == 0:
+        return "Zero"
+    units = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"]
+    teens = ["Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+    tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+    if n < 10:
+        return units[n]
+    elif n < 20:
+        return teens[n - 10]
+    elif n < 100:
+        return tens[n // 10] + ("" if n % 10 == 0 else " " + units[n % 10])
+    else:
+        return "Amount too large"
+
+class BranchSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+    class Meta:
+        model = Branch
+        fields = ['id', 'name', 'code', 'address', 'created_by', 'created_by_name', 'created_at']
+        read_only_fields = ['created_by', 'created_by_name', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
+
+
+class EquipmentSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    class Meta:
+        model = Equipment
+        fields = [
+            'id', 'name', 'description', 'image', 'manufacture_date', 'expiry_date',
+            'category', 'condition', 'location', 'branch', 'branch_name',
+            'created_by', 'created_by_name', 'created_at',
+            'total_quantity', 'available_quantity'
+        ]
+        read_only_fields = ['created_by', 'created_by_name', 'created_at']
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
+
+    def validate(self, data):
+        required = ['name', 'category', 'condition', 'location', 'branch']
+        for field in required:
+            if not data.get(field):
+                raise serializers.ValidationError(f"{field.replace('_', ' ').title()} is required.")
+        return data
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class ReservationSerializer(serializers.ModelSerializer):
+    equipment_name = serializers.CharField(source='equipment.name', read_only=True)
+    reserved_by_name = serializers.CharField(source='reserved_by.email', read_only=True)
+    class Meta:
+        model = Reservation
+        fields = [
+            'id', 'equipment', 'equipment_name', 'reserved_by', 'reserved_by_name',
+            'start_date', 'end_date', 'quantity', 'is_active', 'created_at'
+        ]
+        read_only_fields = ['reserved_by', 'reserved_by_name', 'created_at']
+
+    def validate(self, data):
+        if data.get('end_date') and data['start_date'] > data['end_date']:
+            raise serializers.ValidationError("End date must be after start date.")
+        eq = data['equipment']
+        if data['quantity'] > eq.available_quantity:
+            raise serializers.ValidationError(f"Only {eq.available_quantity} available for reservation.")
+        return data
+
+    def create(self, validated_data):
+        validated_data['reserved_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class RentalSerializer(serializers.ModelSerializer):
+    renter_name = serializers.SerializerMethodField()
+    equipment_name = serializers.CharField(source='equipment.name', read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    approved_by_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    total_rental_cost = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_paid = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    is_overdue = serializers.BooleanField(read_only=True)
+    days_overdue = serializers.IntegerField(read_only=True)
+    duration_days = serializers.IntegerField(read_only=True)
+    is_open_ended = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Rental
+        fields = [
+            'id', 'code', 'renter', 'renter_name', 'equipment', 'equipment_name',
+            'branch', 'branch_name', 'start_date', 'due_date', 'extended_to',
+            'rental_rate', 'currency', 'quantity',
+            'approved_by', 'approved_by_name', 'returned', 'returned_at',
+            'notes', 'created_by', 'created_by_name', 'created_at',
+            'total_rental_cost', 'total_paid', 'balance_due',
+            'is_overdue', 'days_overdue', 'duration_days', 'is_open_ended'
+        ]
+        read_only_fields = [
+            'id', 'code', 'branch', 'created_by', 'created_by_name',
+            'renter_name', 'equipment_name', 'branch_name', 'approved_by_name',
+            'total_rental_cost', 'total_paid', 'balance_due',
+            'is_overdue', 'days_overdue', 'duration_days', 'is_open_ended'
+        ]
+
+    def get_renter_name(self, obj):
+        if obj.renter:
+            return obj.renter.full_name or obj.renter.name or obj.renter.email
+        return "N/A"
+
+    def get_approved_by_name(self, obj):
+        if obj.approved_by:
+            return obj.approved_by.full_name or obj.approved_by.name or obj.approved_by.email
+        return "N/A"
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
+
+    def validate(self, data):
+        method = self.context['request'].method
+        if method == 'POST':
+            required = ['equipment', 'renter', 'start_date', 'quantity']
+            for field in required:
+                if not data.get(field):
+                    raise serializers.ValidationError(f"{field.replace('_', ' ').title()} is required.")
+            if data['quantity'] <= 0:
+                raise serializers.ValidationError("Quantity must be at least 1.")
+        if data.get('due_date') and data.get('start_date') and data['start_date'] > data['due_date']:
+            raise serializers.ValidationError("Due date must be after start date.")
+        if method == 'PATCH' and 'returned' in data and data['returned']:
+            if self.instance and self.instance.returned:
+                raise serializers.ValidationError("Rental is already returned.")
+        return data
+
+    def create(self, validated_data):
+        validated_data['created_by'] = self.context['request'].user
+        return super().create(validated_data)
+
+
+class RentalPaymentSerializer(serializers.ModelSerializer):
+    renter_name = serializers.SerializerMethodField()
+    equipment_name = serializers.CharField(source='rental.equipment.name', read_only=True)
+    currency = serializers.CharField(source='rental.currency', read_only=True)
+    total_rental_cost = serializers.DecimalField(source='rental.total_rental_cost', max_digits=12, decimal_places=2, read_only=True)
+    balance_after_payment = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RentalPayment
+        fields = [
+            'id', 'rental', 'renter_name', 'equipment_name', 'amount_paid', 'amount_in_words',
+            'payment_date', 'status', 'created_by', 'created_at', 'created_by_name', 'currency',
+            'total_rental_cost', 'balance_after_payment'
+        ]
+        read_only_fields = ['payment_date', 'created_by', 'created_at', 'created_by_name', 'currency', 'total_rental_cost']
+
+    def get_renter_name(self, obj):
+        if obj.rental and obj.rental.renter:
+            return obj.rental.renter.full_name or obj.rental.renter.name or obj.rental.renter.email
+        return "N/A"
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.full_name or obj.created_by.name or obj.created_by.email
+        return "N/A"
+
+    def get_balance_after_payment(self, obj):
+        return obj.rental.balance_due  # reflects current state
+
+    def validate(self, data):
+        if data.get('amount_paid', 0) <= 0:
+            raise serializers.ValidationError({'amount_paid': 'Amount paid must be positive.'})
+        return data
+
+    def create(self, validated_data):
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            validated_data['created_by'] = request.user
+        # Auto-fill amount_in_words
+        amount = validated_data['amount_paid']
+        validated_data['amount_in_words'] = number_to_words(int(amount)) + " " + ("Naira" if validated_data.get('rental').currency == 'NGN' else "Dollars")
+        return super().create(validated_data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+views.py:
+# rentals/views.py
+import logging
+from io import BytesIO
+from django.http import HttpResponse
+from django.utils import timezone
+from django.db.models import Q
+from django.conf import settings
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+
+# Import models (ensure Reservation is added to models.py)
+from .models import Equipment, Rental, RentalPayment, Branch, Reservation
+# Import serializers (ensure ReservationSerializer is added to serializers.py)
+from .serializers import (
+    EquipmentSerializer, RentalSerializer, RentalPaymentSerializer,
+    BranchSerializer, ReservationSerializer
+)
+
+logger = logging.getLogger(__name__)
+
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+class BranchViewSet(ModelViewSet):
+    queryset = Branch.objects.all().order_by('name')
+    serializer_class = BranchSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class EquipmentViewSet(ModelViewSet):
+    queryset = Equipment.objects.select_related('branch', 'created_by').all().order_by('-created_at')
+    serializer_class = EquipmentSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class RentalViewSet(ModelViewSet):
+    queryset = Rental.objects.select_related(
+        'renter', 'equipment', 'branch', 'approved_by', 'created_by'
+    ).prefetch_related('payments').all().order_by('-created_at')
+    serializer_class = RentalSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        user = self.request.user
+        return self.queryset.filter(
+            Q(renter=user) | Q(created_by=user) | Q(approved_by=user)
+        )
+
+    @action(detail=True, methods=['post'])
+    def extend_rental(self, request, pk=None):
+        rental = self.get_object()
+        if rental.is_open_ended:
+            return Response({'error': 'Cannot extend open-ended rental.'}, status=400)
+
+        new_due_date_str = request.data.get('new_due_date')
+        if not new_due_date_str:
+            return Response({'error': 'new_due_date is required.'}, status=400)
+
+        try:
+            from datetime import datetime
+            new_due_date = datetime.strptime(new_due_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=400)
+
+        if new_due_date <= rental.start_date:
+            return Response({'error': 'New due date must be after start date.'}, status=400)
+
+        rental.extended_to = new_due_date
+        rental.save(update_fields=['extended_to'])
+        return Response({
+            'message': 'Rental extended successfully.',
+            'extended_to': new_due_date.isoformat()
+        })
+
+    @action(detail=True, methods=['get'])
+    def receipt_pdf(self, request, pk=None):
+        rental = self.get_object()
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch
+        )
+        elements = []
+        styles = getSampleStyleSheet()
+
+        title_style = ParagraphStyle(
+            'ReceiptTitle', parent=styles['Heading1'],
+            fontSize=16, alignment=1, spaceAfter=8, leading=20,
+            textColor=colors.HexColor("#333333")
+        )
+        section_heading = ParagraphStyle(
+            'SectionHeading', parent=styles['Heading3'],
+            fontSize=10.5, spaceBefore=6, spaceAfter=6,
+            textColor=colors.HexColor("#2b2b2b"), leading=13
+        )
+        small_info = ParagraphStyle(
+            'SmallInfo', parent=styles['Normal'],
+            fontSize=9, leading=12, textColor=colors.black
+        )
+
+        # === Header ===
+        if hasattr(settings, 'COMPANY_LOGO_PATH'):
+            try:
+                logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.0*inch, height=0.6*inch)
+                header_table = Table([[
+                    logo_img,
+                    Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/><span>{getattr(settings, 'COMPANY_TAGLINE', '')}</span>", styles['Title']),
+                    Paragraph(
+                        f"<b>Receipt No.</b><br/>{rental.code}<br/><br/>"
+                        f"<b>Date</b><br/>{rental.created_at.strftime('%d/%m/%Y %H:%M')}",
+                        small_info
+                    )
+                ]], colWidths=[1.0*inch, 4.3*inch, 2.2*inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+            except Exception as e:
+                logger.warning(f"Logo load failed: {e}")
+                header_table = Table([[
+                    Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b>", styles['Title']),
+                    Paragraph(
+                        f"<b>Receipt No.</b><br/>{rental.code}<br/><br/>"
+                        f"<b>Date</b><br/>{rental.created_at.strftime('%d/%m/%Y %H:%M')}",
+                        small_info
+                    )
+                ]], colWidths=[5.3*inch, 2.2*inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+                elements.append(Spacer(1, 12))
+        else:
+            header_table = Table([[
+                Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b>", styles['Title']),
+                Paragraph(
+                    f"<b>Receipt No.</b><br/>{rental.code}<br/><br/>"
+                    f"<b>Date</b><br/>{rental.created_at.strftime('%d/%m/%Y %H:%M')}",
+                    small_info
+                )
+            ]], colWidths=[5.3*inch, 2.2*inch])
+            header_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+            ]))
+            elements.append(header_table)
+            elements.append(Spacer(1, 12))
+
+        # Title
+        elements.append(Paragraph("EQUIPMENT RENTAL RECEIPT", title_style))
+        elements.append(Spacer(1, 8))
+
+        # Rental Info
+        elements.append(Paragraph("<b>RENTAL DETAILS</b>", section_heading))
+        rental_data = [
+            ["Rental Code", rental.code],
+            ["Equipment", rental.equipment.name],
+            ["Quantity", str(rental.quantity)],
+            ["Renter", rental.renter.email],
+            ["Start Date", rental.start_date.strftime('%d/%m/%Y')],
+            ["Due Date", rental.effective_due_date.strftime('%d/%m/%Y') if rental.effective_due_date else "Open-ended"],
+            ["Status", "Returned" if rental.returned else "Active"],
+        ]
+        rental_table = Table(rental_data, colWidths=[2.0*inch, 4.1*inch])
+        rental_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(rental_table)
+        elements.append(Spacer(1, 12))
+
+        # Financial Summary
+        elements.append(Paragraph("<b>FINANCIAL SUMMARY</b>", section_heading))
+        fin_data = [
+            ["Rental Rate", f"{rental.rental_rate or 0} {rental.currency}/day"],
+            ["Duration (days)", str(rental.duration_days)],
+            ["Total Incurred", f"{rental.total_rental_cost} {rental.currency}"],
+            ["Total Paid", f"{rental.total_paid} {rental.currency}"],
+            ["Balance Due", f"{rental.balance_due} {rental.currency}"],
+        ]
+        fin_table = Table(fin_data, colWidths=[2.0*inch, 4.1*inch])
+        fin_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(fin_table)
+        elements.append(Spacer(1, 12))
+
+        # Payments
+        elements.append(Paragraph("<b>PAYMENTS</b>", section_heading))
+        payment_rows = [["Date", "Amount", "Status", "In Words"]]
+        for p in rental.payments.all():
+            payment_rows.append([
+                p.payment_date.strftime('%d/%m/%Y'),
+                f"{p.amount_paid} {rental.currency}",
+                p.status,
+                p.amount_in_words or "—"
+            ])
+        if len(payment_rows) == 1:
+            payment_rows.append(["—", "—", "—", "No payments recorded"])
+        pay_table = Table(payment_rows, colWidths=[1.2*inch, 1.5*inch, 1.0*inch, 2.4*inch])
+        pay_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#E0E0E0")),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(pay_table)
+        elements.append(Spacer(1, 18))
+
+        # Footer
+        footer_table = Table([[
+            Paragraph("<i>This rental receipt is auto-generated.</i>", styles['Italic']),
+            Paragraph(f"{getattr(settings, 'COMPANY_NAME', '')}", small_info)
+        ]], colWidths=[4.6*inch, 2.0*inch])
+        footer_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#333333")),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.whitesmoke),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+        ]))
+        elements.append(footer_table)
+
+        doc.build(elements)
+        buffer.seek(0)
+        filename = f"Rental_{rental.code}_receipt.pdf"
+        response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
+    @action(detail=False, methods=['post'])
+    def bulk_return(self, request):
+        rental_ids = request.data.get('ids', [])
+        if not rental_ids:
+            return Response({'error': 'No rental IDs provided'}, status=400)
+        updated = 0
+        for rental_id in rental_ids:
+            try:
+                rental = Rental.objects.get(id=rental_id, returned=False)
+                rental.returned = True
+                rental.returned_at = timezone.now()
+                rental.save()
+                updated += 1
+            except Rental.DoesNotExist:
+                continue
+        return Response({'message': f'{updated} rentals marked as returned.'})
+
+    @action(detail=False, methods=['post'])
+    def bulk_delete(self, request):
+        rental_ids = request.data.get('ids', [])
+        if not rental_ids:
+            return Response({'error': 'No rental IDs provided'}, status=400)
+        deleted = 0
+        for rental_id in rental_ids:
+            try:
+                rental = Rental.objects.get(id=rental_id)
+                if not rental.returned:
+                    continue
+                rental.delete()
+                deleted += 1
+            except Rental.DoesNotExist:
+                continue
+        return Response({'message': f'{deleted} rentals deleted.'})
+
+
+# ✅ Reservation ViewSet — now properly included once
+class ReservationViewSet(ModelViewSet):
+    serializer_class = ReservationSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        user = self.request.user
+        return Reservation.objects.filter(reserved_by=user).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        serializer.save(reserved_by=self.request.user)
+
+
+class RentalPaymentViewSet(ModelViewSet):
+    queryset = RentalPayment.objects.select_related('rental__renter', 'rental__equipment').all().order_by('-created_at')
+    serializer_class = RentalPaymentSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        user = self.request.user
+        return self.queryset.filter(
+            Q(rental__renter=user) |
+            Q(rental__created_by=user) |
+            Q(created_by=user)
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+urls.py:
+# rentals/urls.py
+
+from rest_framework.routers import DefaultRouter
+from django.urls import path, include
+from .views import BranchViewSet, EquipmentViewSet, RentalViewSet, RentalPaymentViewSet, ReservationViewSet
+
+router = DefaultRouter()
+router.register(r'branches', BranchViewSet)
+router.register(r'equipment', EquipmentViewSet)
+router.register(r'rentals', RentalViewSet)
+router.register(r'payments', RentalPaymentViewSet)
+router.register(r'reservations', ReservationViewSet)  # ✅ NEW
+
+urlpatterns = [
+    path('', include(router.urls)),
+]

@@ -23,7 +23,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-=8h1k(&)3!^l(w1j_2ssx*e*5@^1&l7nnad-j5wn7wa7u*6^z7')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
+#DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
+DEBUG = True
 
 # Allow all hosts in Azure (safe due to Azure's infrastructure)
 if 'WEBSITE_HOSTNAME' in os.environ:
@@ -34,8 +35,9 @@ else:
         "localhost,127.0.0.1,[::1],kenyonltd.azurewebsites.net,kenyonltd-cmf5baa0fhcqahgj.canadacentral-01.azurewebsites.net"
     ).split(",")
 
+
 MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 # Application definition
 INSTALLED_APPS = [
@@ -207,6 +209,10 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+# settings.py
+COMPANY_NAME = "Kenyon West Africa Co. Ltd."
+COMPANY_ADDRESS = "Plot 140 Eneka-Igwuruta Road, Eneka, Port Harcourt, Rivers, Nigeria"
+COMPANY_LOGO_PATH = os.path.join(BASE_DIR, 'inventory', 'static', 'images', 'kenyon_logo.png')  
 
 # Logging
 LOGGING = {

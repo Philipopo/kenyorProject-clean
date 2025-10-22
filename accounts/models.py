@@ -179,10 +179,30 @@ FINANCE_ACTIONS = [
 ]
 
 RENTALS_PAGES = ["rentals_active", "rentals_equipment", "rentals_payments", "branches"]
-RENTALS_ACTIONS = ["create_rental", "update_rental", "delete_rental", "create_equipment", "create_payment", "create_branch", "update_branch", "delete_branch"]
+RENTALS_ACTIONS = ["create_rental", "update_rental", "delete_rental", "create_equipment", "create_payment", "create_branch", "update_branch", "delete_branch", "create_reservation", "update_reservation", "delete_reservation",]
 
-ANALYTICS_PAGES = ["analytics_dwell", "analytics_eoq", "analytics_stock"]
-ANALYTICS_ACTIONS = ["create_dwell", "create_eoq", "create_stock_analytics"]
+ANALYTICS_PAGES = [
+    "analytics_dwell",          # Dwell Time Analysis page
+    "analytics_eoq",            # Stock Optimization (EOQ) page
+    "analytics_stock",          # Stock Analytics page
+    "analytics_supplier",       # Suppliers tab in Stock Optimization
+    "analytics_reorder", 
+    "analytics_forecast",       # Reorder Queue access
+]
+
+ANALYTICS_ACTIONS = [
+    "create_dwell",             # Create dwell time records
+    "create_eoq",               # Create EOQ reports
+    "update_eoq",               # Update EOQ reports
+    "delete_eoq",               # Delete EOQ reports
+    "create_stock_analytics",   # Create stock analytics (ABC) records
+    "create_supplier",          # Create suppliers
+    "update_supplier",          # Update suppliers
+    "delete_supplier",          # Delete suppliers
+    "create_reorder",           # Create reorder queue entries (Added)
+    "update_reorder",           # Update reorder queue entries (Added)
+    "delete_reorder",           # Delete reorder queue entries (Added)
+]
 
 PRODUCT_DOCUMENTATION_PAGES = [
     "product_documentation",        # Main page (list inflows/outflows)
@@ -233,6 +253,13 @@ ANNOUNCEMENT_PAGES = ["announcement"]
 BRANDING_ACTIONS = ["update_branding", "create_branding", "delete_branding"]
 ANNOUNCEMENT_ACTIONS = ["create_announcement", "update_announcement", "delete_announcement"]
 
+NOTIFICATION_ACTIONS = [
+    "view_notifications",
+    "mark_notification_read",
+    "mark_all_notifications_read"
+]
+
+
 # Add these to your ERP and Tracker pages if they don't exist
 ERP_PAGES = ['erp_integration']
 TRACKER_PAGES = ['trackers']
@@ -246,5 +273,5 @@ ALL_PAGES = (
 ALL_ACTIONS = (
     INVENTORY_ACTIONS + PROCUREMENT_ACTIONS + RECEIPT_ACTIONS + FINANCE_ACTIONS +
     RENTALS_ACTIONS + ANALYTICS_ACTIONS + PRODUCT_DOCUMENTATION_ACTIONS + PRODUCT_DOCUMENTATION_NEW_ACTIONS + 
-    WAREHOUSE_NEW_ACTIONS + WAREHOUSE_ACTIONS + BRANDING_ACTIONS + ANNOUNCEMENT_ACTIONS
+    WAREHOUSE_NEW_ACTIONS + WAREHOUSE_ACTIONS + BRANDING_ACTIONS + ANNOUNCEMENT_ACTIONS + NOTIFICATION_ACTIONS
 )

@@ -18,8 +18,8 @@ class DashboardMetricsView(APIView):
 
     def get(self, request):
         user = request.user
-        total_stock_items = Item.objects.filter(created_by=user).count()
-        low_stock_items = Item.objects.filter(created_by=user, total_quantity__lte=Item._meta.get_field('min_stock_level').default).count()
+        total_stock_items = Item.objects.filter(user=user).count()  # Changed to user
+        low_stock_items = Item.objects.filter(user=user, total_quantity__lte=Item._meta.get_field('min_stock_level').default).count()  # Changed to user
         dwell_items = DwellTime.objects.filter(user=user).count()
         eoq_reports = EOQReportV2.objects.filter(user=user).count()
         reorder_queue = ReorderQueue.objects.filter(user=user, status='Pending').count()
@@ -178,7 +178,7 @@ class DemandForecastView(APIView):
             return Response({"error": "Item ID is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            item = Item.objects.get(id=item_id, created_by=request.user)
+            item = Item.objects.get(id=item_id, user=request.user)  # Fixed: Changed created_by to user
         except Item.DoesNotExist:
             return Response({"error": "Item not found"}, status=status.HTTP_404_NOT_FOUND)
 

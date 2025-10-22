@@ -2,6 +2,11 @@ from rest_framework import serializers
 from .models import DwellTime, EOQReport, EOQReportV2, StockAnalytics, ReorderQueue, Supplier
 from inventory.models import Item
 
+class ItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Item
+        fields = ['id', 'name', 'material_id', 'part_number', 'description']
+
 class DwellTimeSerializer(serializers.ModelSerializer):
     class Meta:
         model = DwellTime
@@ -32,7 +37,7 @@ class EOQReportV2Serializer(serializers.ModelSerializer):
         model = EOQReportV2
         fields = [
             'id', 'user', 'user_email', 'item', 'item_name', 'part_number',
-            'demand_rate', 'order_cost', 'holding_cost', 'lead_time_days',
+            'demand_rate', 'ordering_cost', 'holding_cost', 'lead_time_days',  # Changed order_cost to ordering_cost
             'safety_stock', 'eoq', 'reorder_point', 'total_cost',
             'holding_cost_breakdown', 'ordering_cost_breakdown', 'inventory_turnover',
             'supplier', 'supplier_name', 'created_at', 'updated_at'
@@ -46,8 +51,8 @@ class EOQReportV2Serializer(serializers.ModelSerializer):
     def validate(self, data):
         if data.get('demand_rate', 0) <= 0:
             raise serializers.ValidationError("Demand rate must be positive.")
-        if data.get('order_cost', 0) <= 0:
-            raise serializers.ValidationError("Order cost must be positive.")
+        if data.get('ordering_cost', 0) <= 0:  # Changed to ordering_cost
+            raise serializers.ValidationError("Ordering cost must be positive.")
         if data.get('holding_cost', 0) <= 0:
             raise serializers.ValidationError("Holding cost must be positive.")
         if data.get('lead_time_days', 0) < 0:

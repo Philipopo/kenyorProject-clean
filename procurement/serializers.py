@@ -101,9 +101,10 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         model = PurchaseOrder
         fields = '__all__'
         read_only_fields = [
-            'code', 'total_amount', 'approved_by', 'created_at', 
-            'updated_at', 'approved_at', 'created_by'  # Add created_by
+            'code', 'total_amount', 'approved_by', 'created_at',
+            'updated_at', 'approved_at', 'created_by'
         ]
+        # Do NOT include 'layout' in read_only_fields
 
     def validate(self, data):
         if not data.get('vendor'):
@@ -170,7 +171,7 @@ class ReceivingItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReceivingItem
         fields = '__all__'
-        read_only_fields = ['rejected_quantity']
+        read_only_fields = ['rejected_quantity', 'receiving']  # ✅ Exclude from input
 
     def validate(self, data):
         po_item = data.get('po_item')
@@ -196,6 +197,7 @@ class ReceivingItemSerializer(serializers.ModelSerializer):
         
         return data
 
+
 class ReceivingSerializer(serializers.ModelSerializer):
     items = ReceivingItemSerializer(many=True, required=False)
     po_code = serializers.CharField(source='po.code', read_only=True)
@@ -205,29 +207,35 @@ class ReceivingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Receiving
         fields = '__all__'
-        read_only_fields = ['grn', 'created_at', 'updated_at']
-
-    def validate(self, data):
-        if not data.get('po'):
-            raise serializers.ValidationError({'po': 'Purchase Order is required.'})
-        
-        if self.context['request'].method == 'POST':
-            if not self.initial_data.get('items') or len(self.initial_data.get('items', [])) == 0:
-                raise serializers.ValidationError({'items': 'At least one receiving item is required.'})
-        
-        return data
+        read_only_fields = [
+            'grn', 'created_at', 'updated_at', 
+            'created_by', 'received_by'  # ✅ Make it read-only
+        ]
 
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
-        receiving = Receiving.objects.create(**validated_data)
         
+        # Create the Receiving instance FIRST
+        receiving = Receiving.objects.create(
+            po=validated_data['po'],
+            invoice_number=validated_data['invoice_number'],
+            invoice_date=validated_data['invoice_date'],
+            notes=validated_data.get('notes', ''),
+            received_by=self.context['request'].user,  # ✅ Auto-set from JWT
+            created_by=self.context['request'].user
+        )
+        
+        # THEN create ReceivingItems linked to it
         for item_data in items_data:
-            ReceivingItem.objects.create(receiving=receiving, **item_data)
+            ReceivingItem.objects.create(
+                receiving=receiving,  # ✅ Link to parent
+                **item_data
+            )
         
-        # Update PO status
         receiving.update_po_status()
         return receiving
+
 
     @transaction.atomic
     def update(self, instance, validated_data):
@@ -244,6 +252,33 @@ class ReceivingSerializer(serializers.ModelSerializer):
             instance.update_po_status()
         
         return instance
+
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        
+        # Create Receiving FIRST (without items)
+        receiving = Receiving.objects.create(
+            po=validated_data['po'],
+            invoice_number=validated_data['invoice_number'],
+            invoice_date=validated_data['invoice_date'],
+            notes=validated_data.get('notes', ''),
+            received_by=self.context['request'].user,
+            created_by=self.context['request'].user
+        )
+        
+        # THEN create ReceivingItems linked to it
+        for item_data in items_data:
+            ReceivingItem.objects.create(
+                receiving=receiving,
+                **item_data
+            )
+        
+        receiving.update_po_status()
+        return receiving
+
+        
 
 class ProcurementAuditLogSerializer(serializers.ModelSerializer):
     class Meta:
