@@ -1,0 +1,2144 @@
+ models.py:
+# accounts/models.py
+from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
+from django.db import models
+from django.conf import settings
+import secrets
+
+ROLE_LEVELS = {
+    "staff": 1,
+    "finance_manager": 2,
+    "operations_manager": 3,
+    "md": 4,
+    "admin": 5,
+}
+
+class ApiKey(models.Model):
+    key = models.CharField(max_length=64, unique=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='api_keys')
+    name = models.CharField(max_length=100, blank=True, help_text="Descriptive name for the API key")
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_api_keys',
+        help_text="User who created this API key"
+    )
+    is_active = models.BooleanField(default=True)
+    is_viewed = models.BooleanField(default=False, help_text="True if key has been viewed")
+
+    def save(self, *args, **kwargs):
+        if not self.key:
+            self.key = secrets.token_urlsafe(32)  # Generates a 64-char secure key
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.name or 'API Key'} ({self.user.email})"
+
+
+
+class UserManager(BaseUserManager):
+    def create_user(self, email, password=None, role='staff', **extra_fields):
+        if not email:
+            raise ValueError("Email is required")
+        email = self.normalize_email(email)
+        user = self.model(email=email, role=role, **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, password=None, **extra_fields):
+        extra_fields.setdefault('is_superuser', True)
+        extra_fields.setdefault('is_staff', True)
+        return self.create_user(email, password, role='admin', **extra_fields)
+
+ROLE_CHOICES = (
+    ('staff', 'Staff'),
+    ('finance_manager', 'Finance Manager'),
+    ('operations_manager', 'Operations Manager'),
+    ('md', 'Managing Director'),
+    ('admin', 'Admin'),
+)
+
+NIGERIAN_STATES = (
+    ('Abia', 'Abia'), ('Adamawa', 'Adamawa'), ('Akwa Ibom', 'Akwa Ibom'), ('Anambra', 'Anambra'),
+    ('Bauchi', 'Bauchi'), ('Bayelsa', 'Bayelsa'), ('Benue', 'Benue'), ('Borno', 'Borno'),
+    ('Cross River', 'Cross River'), ('Delta', 'Delta'), ('Ebonyi', 'Ebonyi'), ('Edo', 'Edo'),
+    ('Ekiti', 'Ekiti'), ('Enugu', 'Enugu'), ('FCT', 'FCT'), ('Gombe', 'Gombe'),
+    ('Imo', 'Imo'), ('Jigawa', 'Jigawa'), ('Kaduna', 'Kaduna'), ('Kano', 'Kano'),
+    ('Katsina', 'Katsina'), ('Kebbi', 'Kebbi'), ('Kogi', 'Kogi'), ('Kwara', 'Kwara'),
+    ('Lagos', 'Lagos'), ('Nasarawa', 'Nasarawa'), ('Niger', 'Niger'), ('Ogun', 'Ogun'),
+    ('Ondo', 'Ondo'), ('Osun', 'Osun'), ('Oyo', 'Oyo'), ('Plateau', 'Plateau'),
+    ('Rivers', 'Rivers'), ('Sokoto', 'Sokoto'), ('Taraba', 'Taraba'), ('Yobe', 'Yobe'),
+    ('Zamfara', 'Zamfara'),
+)
+
+class User(AbstractBaseUser, PermissionsMixin):
+    email = models.EmailField(unique=True)
+    name = models.CharField(max_length=255)
+    role = models.CharField(max_length=30, choices=ROLE_CHOICES, default='staff')
+    is_active = models.BooleanField(default=True)
+    is_staff = models.BooleanField(default=False)
+    full_name = models.CharField(max_length=100, blank=True)
+    objects = UserManager()
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = ['name']
+    EMAIL_FIELD = 'email'
+    def __str__(self):
+        return self.email
+
+def profile_image_upload_path(instance, filename):
+    return f'profile_images/user_{instance.user.id}/{filename}'
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
+    full_name = models.CharField(max_length=255, blank=True)
+    profile_image = models.ImageField(upload_to=profile_image_upload_path, blank=True, null=True)
+    city = models.CharField(max_length=100, blank=True, null=True)
+    state = models.CharField(max_length=100, choices=NIGERIAN_STATES, default='Lagos')
+    last_location_update = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.full_name or self.user.email
+
+class PagePermission(models.Model):
+    page_name = models.CharField(max_length=100, unique=True)
+    min_role = models.CharField(max_length=30, choices=ROLE_CHOICES, default='staff')
+    def __str__(self):
+        return f"Page: {self.page_name} requires {self.min_role}+"
+
+class ActionPermission(models.Model):
+    action_name = models.CharField(max_length=100, unique=True)
+    min_role = models.CharField(max_length=30, choices=ROLE_CHOICES, default='staff')
+    def __str__(self):
+        return f"Action: {self.action_name} requires {self.min_role}+"
+
+PERMISSION_ROLES = {
+    'default': 'staff',
+    'product_documentation': 'finance_manager',
+    'delete_product_inflow': 'admin',
+    'delete_product_outflow': 'admin',
+    'warehouse': 'finance_manager',
+    'update_location': 'staff',
+}
+
+INVENTORY_PAGES = [
+    'inventory_metrics',
+    'storage_bins', 
+    'expired_items', 
+    'items', 
+    'stock_records', 
+    'expiry_tracked_items', 
+    'aisle_rack_dashboard', 
+    'update_expiry_tracked_item', 
+    'delete_expiry_tracked_item', 'inventory_activity_logs',
+    'stock_movements',  
+    'import_items_csv',  
+]
+
+# Add to INVENTORY_ACTIONS  
+INVENTORY_ACTIONS = [
+    'create_storage_bin', 'create_item', 'create_stock_record', 'create_expiry_tracked_item',
+    'update_storage_bin', 'update_item', 'update_stock_record', 'update_expiry_tracked_item',
+    'delete_item', 'delete_storage_bin', 'delete_stock_record', 'delete_expiry_tracked_item',
+    'generate_api_key', 'view_api_key', 'delete_api_key',
+    'create_warehouse', 'update_warehouse', 'delete_warehouse',
+    'stock_in', 'stock_out', 'import_items_csv'
+]
+
+PROCUREMENT_PAGES = [
+    "requisitions", "purchase_orders", "po_items", "receiving", "goods_receipts", "vendors", "procurement_audit_logs"
+]
+
+PROCUREMENT_ACTIONS = [
+    "create_requisition", "approve_requisition", "reject_requisition", "update_requisition", "delete_requisition",
+    "create_purchase_order", "approve_purchase_order", "update_purchase_order", "delete_purchase_order",
+    "create_po_item", "update_po_item", "delete_po_item",
+    "create_receiving", "update_receiving", "delete_receiving",
+    "add_vendor", "update_vendor", "delete_vendor",
+    "view_procurement_audit_logs"
+]
+
+RECEIPT_PAGES = ["receipt_archive", "stock_receipts", "signing_receipts"]
+RECEIPT_ACTIONS = [
+    "create_receipt", "create_stock_receipt", "create_signing_receipt",
+    "update_receipt", "delete_receipt",  # Added
+    "update_stock_receipt", "delete_stock_receipt",  # Added
+    "update_signing_receipt", "delete_signing_receipt",'add_receipt_approver',
+    'remove_receipt_approver',
+    'sign_receipt',    # Added
+]
+
+
+
+FINANCE_PAGES = ["finance_categories", "finance_transactions", "finance_overview"]
+FINANCE_ACTIONS = [
+    "create_finance_category", "create_finance_transaction",
+    "update_finance_category", "delete_finance_category",
+    "update_finance_transaction", "delete_finance_transaction",
+]
+
+RENTALS_PAGES = ["rentals_active", "rentals_equipment", "rentals_payments", "branches"]
+RENTALS_ACTIONS = ["create_rental", "update_rental", "delete_rental", "create_equipment", "create_payment", "create_branch", "update_branch", "delete_branch", "create_reservation", "update_reservation", "delete_reservation",]
+
+ANALYTICS_PAGES = [
+    "analytics_dwell",          # Dwell Time Analysis page
+    "analytics_eoq",            # Stock Optimization (EOQ) page
+    "analytics_stock",          # Stock Analytics page
+    "analytics_supplier",       # Suppliers tab in Stock Optimization
+    "analytics_reorder", 
+    "analytics_forecast",       # Reorder Queue access
+]
+
+ANALYTICS_ACTIONS = [
+    "create_dwell",             # Create dwell time records
+    "create_eoq",               # Create EOQ reports
+    "update_eoq",               # Update EOQ reports
+    "delete_eoq",               # Delete EOQ reports
+    "create_stock_analytics",   # Create stock analytics (ABC) records
+    "create_supplier",          # Create suppliers
+    "update_supplier",          # Update suppliers
+    "delete_supplier",          # Delete suppliers
+    "create_reorder",           # Create reorder queue entries (Added)
+    "update_reorder",           # Update reorder queue entries (Added)
+    "delete_reorder",           # Delete reorder queue entries (Added)
+]
+
+PRODUCT_DOCUMENTATION_PAGES = [
+    "product_documentation",        # Main page (list inflows/outflows)
+    "product_inflow",               # Inflow list/detail
+    "product_outflow",              # Outflow list/detail
+    "product_documentation_logs",   # Activity logs page
+]
+
+PRODUCT_DOCUMENTATION_ACTIONS = [
+    # Inflow actions
+    "create_product_inflow",
+    "update_product_inflow",
+    "delete_product_inflow",
+    
+    # Outflow actions
+    "create_product_outflow",
+    "update_product_outflow",
+    "delete_product_outflow",
+    
+    # Log viewing (read-only, so lower permission)
+    "view_product_documentation_logs",
+]
+
+PRODUCT_DOCUMENTATION_NEW_PAGES = ["product_documentation_new", "product_inflow_new", "product_outflow_inflow_new"]
+PRODUCT_DOCUMENTATION_NEW_ACTIONS = [
+    "create_product_new_inflow", "update_product_new_inflow", "delete_product_new_inflow",
+    "create_product__new_outflow", "update_product_new_outflow", "delete_product_outflow",
+]
+
+RENTALS_ACTIONS = [
+    "create_rental", "update_rental", "delete_rental",
+    "create_equipment", "update_equipment", "delete_equipment",
+    "create_payment", "update_payment", "delete_payment", "mark_rental_returned",
+    "view_overdue_rentals"
+]
+
+
+WAREHOUSE_NEW_PAGES = ['warehouse_new']
+WAREHOUSE_NEW_ACTIONS = ['create_warehouse_new_item', 'update_warehouse_item', 'delete_warehouse_item', 'update_location']
+
+WAREHOUSE_PAGES = ['warehouse_']
+WAREHOUSE_ACTIONS = ['create_warehouse_item', 'update_warehouse_new_item', 'delete_warehouse_new_item', 'update_location']
+
+
+BRANDING_PAGES = ["branding", "company_branding"]  # Added company_branding
+ANNOUNCEMENT_PAGES = ["announcement"]
+
+BRANDING_ACTIONS = ["update_branding", "create_branding", "delete_branding"]
+ANNOUNCEMENT_ACTIONS = ["create_announcement", "update_announcement", "delete_announcement"]
+
+NOTIFICATION_ACTIONS = [
+    "view_notifications",
+    "mark_notification_read",
+    "mark_all_notifications_read"
+]
+
+
+# Add these to your ERP and Tracker pages if they don't exist
+ERP_PAGES = ['erp_integration']
+TRACKER_PAGES = ['trackers']
+
+ALL_PAGES = (
+    INVENTORY_PAGES + PROCUREMENT_PAGES + RECEIPT_PAGES + FINANCE_PAGES +
+    RENTALS_PAGES + ANALYTICS_PAGES + PRODUCT_DOCUMENTATION_PAGES + PRODUCT_DOCUMENTATION_NEW_PAGES + WAREHOUSE_NEW_PAGES + WAREHOUSE_PAGES + BRANDING_PAGES + ANNOUNCEMENT_PAGES +
+    ERP_PAGES + TRACKER_PAGES  # Added new pages
+)
+
+ALL_ACTIONS = (
+    INVENTORY_ACTIONS + PROCUREMENT_ACTIONS + RECEIPT_ACTIONS + FINANCE_ACTIONS +
+    RENTALS_ACTIONS + ANALYTICS_ACTIONS + PRODUCT_DOCUMENTATION_ACTIONS + PRODUCT_DOCUMENTATION_NEW_ACTIONS + 
+    WAREHOUSE_NEW_ACTIONS + WAREHOUSE_ACTIONS + BRANDING_ACTIONS + ANNOUNCEMENT_ACTIONS + NOTIFICATION_ACTIONS
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+serializer.py:
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+from .models import UserProfile, PagePermission, ActionPermission, ApiKey
+
+User = get_user_model()
+
+class PagePermissionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PagePermission
+        fields = ['id', 'page_name', 'min_role']
+
+class ActionPermissionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ActionPermission
+        fields = ['id', 'action_name', 'min_role']
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True)
+    class Meta:
+        model = User
+        fields = ['email', 'name', 'password', 'role']
+    def create(self, validated_data):
+        return User.objects.create_user(**validated_data)
+
+class UserSerializer(serializers.ModelSerializer):
+    profile = serializers.SerializerMethodField()
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'name', 'role', 'profile']
+    def get_profile(self, obj):
+        profile = obj.profile
+        return {
+            'full_name': profile.full_name or obj.name or obj.email.split('@')[0],
+            'profile_image': profile.profile_image.url if profile.profile_image else None,
+            'state': profile.state
+        }
+
+class UserListSerializer(serializers.ModelSerializer):
+    status = serializers.SerializerMethodField()
+    full_name = serializers.SerializerMethodField()
+    class Meta:
+        model = User
+        fields = ['id', 'full_name', 'email', 'role', 'status']
+    def get_full_name(self, obj):
+        return obj.name
+    def get_status(self, obj):
+        return "Active" if obj.is_active else "Inactive"
+
+class ProfileSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(source='user.email', read_only=True)
+    name = serializers.CharField(source='user.name', read_only=True)
+    role = serializers.CharField(source='user.role', read_only=True)
+    full_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    class Meta:
+        model = UserProfile
+        fields = ['email', 'name', 'full_name', 'profile_image', 'role', 'state']
+        read_only_fields = ['email', 'name', 'role']
+
+class ProfilePictureUploadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserProfile
+        fields = ['profile_image']
+
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+class ResetPasswordSerializer(serializers.Serializer):
+    new_password = serializers.CharField(min_length=6, write_only=True)
+    token = serializers.CharField()
+    uid = serializers.CharField()
+
+
+    
+
+class ApiKeySerializer(serializers.ModelSerializer):
+    created_by_email = serializers.EmailField(source='created_by.email', read_only=True)
+    created_by_full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ApiKey
+        fields = ['id', 'name', 'key', 'user', 'created_by_email', 'created_by_full_name', 'created_at', 'is_active', 'is_viewed']
+        read_only_fields = ['id', 'key', 'created_at', 'created_by_email', 'created_by_full_name', 'is_viewed', 'user']
+        extra_kwargs = {
+            'name': {'required': False, 'allow_blank': True},
+        }
+
+    def get_created_by_full_name(self, obj):
+        profile = UserProfile.objects.filter(user=obj.created_by).first()
+        return profile.full_name if profile and profile.full_name else obj.created_by.name
+
+    def validate(self, data):
+        if self.context['request'].method == 'POST':
+            data['created_by'] = self.context['request'].user
+            if not data.get('name'):
+                data['name'] = 'Unnamed'
+        return data
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+views.py:
+import logging
+import secrets
+import string
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework import generics, status, permissions, serializers, viewsets
+from rest_framework.generics import CreateAPIView, DestroyAPIView
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework.decorators import api_view, permission_classes, action
+from django.views.decorators.csrf import csrf_exempt
+from .models import User, UserProfile, PagePermission, ActionPermission, ApiKey
+from .serializers import (
+    RegisterSerializer, UserSerializer, UserListSerializer, ProfileSerializer,
+    ProfilePictureUploadSerializer, ForgotPasswordSerializer,
+    ResetPasswordSerializer, PagePermissionSerializer, ActionPermissionSerializer, ApiKeySerializer
+)
+from .token_serializers import CustomTokenObtainPairSerializer
+from .permissions import HasMinimumRole, APIKeyPermission
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils.encoding import force_bytes, force_str
+from django.conf import settings
+from django.utils import timezone
+import requests
+from fuzzywuzzy import process
+
+logger = logging.getLogger(__name__)
+
+NIGERIAN_STATES = [
+    ('Abia', 'Abia'), ('Adamawa', 'Adamawa'), ('Akwa Ibom', 'Akwa Ibom'), ('Anambra', 'Anambra'),
+    ('Bauchi', 'Bauchi'), ('Bayelsa', 'Bayelsa'), ('Benue', 'Benue'), ('Borno', 'Borno'),
+    ('Cross River', 'Cross River'), ('Delta', 'Delta'), ('Ebonyi', 'Ebonyi'), ('Edo', 'Edo'),
+    ('Ekiti', 'Ekiti'), ('Enugu', 'Enugu'), ('FCT', 'Federal Capital Territory'),
+    ('Gombe', 'Gombe'), ('Imo', 'Imo'), ('Jigawa', 'Jigawa'), ('Kaduna', 'Kaduna'),
+    ('Kano', 'Kano'), ('Katsina', 'Katsina'), ('Kebbi', 'Kebbi'), ('Kogi', 'Kogi'),
+    ('Kwara', 'Kwara'), ('Lagos', 'Lagos'), ('Nasarawa', 'Nasarawa'), ('Niger', 'Niger'),
+    ('Ogun', 'Ogun'), ('Ondo', 'Ondo'), ('Osun', 'Osun'), ('Oyo', 'Oyo'),
+    ('Plateau', 'Plateau'), ('Rivers', 'Rivers'), ('Sokoto', 'Sokoto'),
+    ('Taraba', 'Taraba'), ('Yobe', 'Yobe'), ('Zamfara', 'Zamfara')
+]
+
+STATE_VARIATIONS = {
+    'Lagos State': 'Lagos',
+    'Abuja': 'FCT',
+    'Federal Capital Territory': 'FCT',
+    'Oyo State': 'Oyo',
+    'Kano State': 'Kano',
+    'Anambra State': 'Anambra',
+    'Rivers State': 'Rivers',
+    'Delta State': 'Delta',
+    'Abuja Federal Capital Territory': 'FCT',
+    'FCT Abuja': 'FCT',
+    'Kaduna State': 'Kaduna',
+    'Ogun State': 'Ogun',
+}
+
+ROLE_LEVELS = {
+    "staff": 1,
+    "finance_manager": 2,
+    "operations_manager": 3,
+    "md": 4,
+    "admin": 5,
+}
+
+def get_user_role_level(user):
+    return ROLE_LEVELS.get(getattr(user, 'role', 'staff').lower(), 0)
+
+def get_page_required_level(page):
+    perm = PagePermission.objects.filter(page_name=page).first()
+    return ROLE_LEVELS.get(perm.min_role.lower(), 1) if perm else 1
+
+def get_action_required_level(action_name: str) -> int:
+    try:
+        perm = ActionPermission.objects.get(action_name=action_name)
+        return ROLE_LEVELS.get(perm.min_role.lower(), 1)
+    except ActionPermission.DoesNotExist:
+        return 1
+
+def check_permission(user, page=None, action=None):
+    logger.info(f"[check_permission] Checking for user: {user}, role: {getattr(user, 'role', 'None')}, page: {page}, action: {action}")
+    user_level = get_user_role_level(user)
+    if not user.is_authenticated:
+        logger.warning("[check_permission] User not authenticated")
+        raise permissions.PermissionDenied("User not authenticated")
+    if page:
+        required = get_page_required_level(page)
+        if user_level < required:
+            logger.warning(f"[check_permission] Denied: page {page} requires level {required}, user has {user_level}")
+            raise permissions.PermissionDenied(f"Access denied: {page} requires role level {required}")
+    if action:
+        required = get_action_required_level(action)
+        if user_level < required:
+            logger.warning(f"[check_permission] Denied: action {action} requires level {required}, user has {user_level}")
+            raise permissions.PermissionDenied(f"Access denied: {action} requires role level {required}")
+    return True
+
+class SomeProtectedView(APIView):
+    permission_classes = [IsAuthenticated, HasMinimumRole]
+    required_role_level = 2
+    def get(self, request):
+        return Response({"message": "Authorized access"})
+
+class MeView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request):
+        user = request.user
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        return Response({
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "name": profile.full_name or user.name or user.email.split('@')[0]
+        })
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
+    @classmethod
+    def as_view(cls, **initkwargs):
+        view = super().as_view(**initkwargs)
+        return csrf_exempt(view)
+
+class UserProfileView(generics.RetrieveUpdateAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = ProfileSerializer
+    def get_object(self):
+        check_permission(self.request.user, page='user_profile')
+        profile, created = UserProfile.objects.get_or_create(user=self.request.user)
+        return profile
+    def perform_update(self, serializer):
+        logger.info(f"[UserProfileView] Validated data: {serializer.validated_data}")
+        profile = serializer.save()
+        full_name = serializer.validated_data.get('full_name')
+        if full_name:
+            self.request.user.name = full_name
+            self.request.user.full_name = full_name
+            self.request.user.save()
+            logger.info(f"[UserProfileView] Updated User.name and User.full_name to: {full_name}")
+
+class ProfilePictureUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+    def post(self, request, *args, **kwargs):
+        profile, created = UserProfile.objects.get_or_create(user=request.user)
+        serializer = ProfilePictureUploadSerializer(profile, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "detail": "Profile image uploaded successfully.",
+                "profile_image": serializer.data['profile_image']
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserListView(generics.ListAPIView):
+    queryset = User.objects.all().order_by('id')
+    serializer_class = UserListSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # Only return active users who can be added to approval board
+        return User.objects.filter(is_active=True).order_by('name', 'email')
+    
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        serializer = self.get_serializer(queryset, many=True)
+        # Return in the format your frontend expects
+        return Response({
+            'results': serializer.data,
+            'count': queryset.count()
+        })
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({"message": "User created successfully"})
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request):
+        serializer = UserSerializer(request.user)
+        return Response(serializer.data)
+
+class ChangePasswordSerializer(serializers.Serializer):
+    old_password = serializers.CharField(required=True)
+    new_password = serializers.CharField(required=True)
+
+class ChangePasswordView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        if serializer.is_valid():
+            if not request.user.check_password(serializer.validated_data['old_password']):
+                return Response({'old_password': 'Incorrect'}, status=400)
+            request.user.set_password(serializer.validated_data['new_password'])
+            request.user.save()
+            return Response({'detail': 'Password changed successfully'})
+        return Response(serializer.errors, status=400)
+
+class AdminCreateUserView(CreateAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = RegisterSerializer
+    def post(self, request, *args, **kwargs):
+        if request.user.role != 'admin':
+            return Response({"detail": "Only admin users can create accounts."}, status=403)
+        data = request.data.copy()
+        data['password'] = 'Password10'
+        serializer = self.get_serializer(data=data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({"message": "User created successfully with default password 'Password10'"})
+        return Response(serializer.errors, status=400)
+
+class AdminDeleteUserView(DestroyAPIView):
+    permission_classes = [IsAuthenticated]
+    queryset = User.objects.all()
+    lookup_field = 'id'
+    def delete(self, request, *args, **kwargs):
+        if request.user.role != 'admin':
+            return Response({"detail": "Only admin users can delete accounts."}, status=403)
+        return super().delete(request, *args, **kwargs)
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request):
+        try:
+            refresh_token = request.data.get("refresh")
+            if not refresh_token:
+                return Response({"detail": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response({"detail": "Successfully logged out."}, status=status.HTTP_205_RESET_CONTENT)
+        except TokenError:
+            return Response({"detail": "Invalid or expired token."}, status=status.HTTP_400_BAD_REQUEST)
+
+class IsAdminRole(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role == "admin"
+
+class PagePermissionViewSet(viewsets.ModelViewSet):
+    queryset = PagePermission.objects.all()
+    serializer_class = PagePermissionSerializer
+    permission_classes = [IsAuthenticated, IsAdminRole]
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        if "min_role" not in data:
+            data["min_role"] = "staff"
+        instance = PagePermission.objects.filter(page_name=data.get("page_name")).first()
+        if instance:
+            serializer = self.get_serializer(instance, data=data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+class ActionPermissionViewSet(viewsets.ModelViewSet):
+    queryset = ActionPermission.objects.all()
+    serializer_class = ActionPermissionSerializer
+    permission_classes = [IsAuthenticated, IsAdminRole]
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        if "min_role" not in data:
+            data["min_role"] = "staff"
+        instance = ActionPermission.objects.filter(action_name=data.get("action_name")).first()
+        if instance:
+            serializer = self.get_serializer(instance, data=data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def page_allowed(request, page_name):
+    try:
+        permission = PagePermission.objects.get(page_name=page_name)
+        user_role = request.user.role
+        if ROLE_LEVELS.get(user_role, 0) >= ROLE_LEVELS.get(permission.min_role, 0):
+            return Response({"allowed": True})
+        else:
+            return Response({"allowed": False, "reason": f"Requires {permission.min_role} role"})
+    except PagePermission.DoesNotExist:
+        return Response({"allowed": False, "reason": "page_not_configured"})
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def action_allowed(request, action_name: str):
+    try:
+        action_perm = ActionPermission.objects.get(action_name=action_name)
+    except ActionPermission.DoesNotExist:
+        return Response({"allowed": False, "reason": "action_not_configured"})
+    user_role = getattr(request.user, "role", "staff")
+    user_level = ROLE_LEVELS.get(user_role.lower(), 0)
+    required_level = ROLE_LEVELS.get(action_perm.min_role.lower(), 999)
+    return Response({"allowed": user_level >= required_level})
+
+class ForgotPasswordView(APIView):
+    permission_classes = [AllowAny]
+    def post(self, request):
+        serializer = ForgotPasswordSerializer(data=request.data)
+        if serializer.is_valid():
+            email = serializer.validated_data['email']
+            try:
+                user = User.objects.get(email=email)
+                token_generator = PasswordResetTokenGenerator()
+                token = token_generator.make_token(user)
+                uid = urlsafe_base64_encode(force_bytes(user.pk))
+                reset_url = f"{settings.FRONTEND_URL}/reset-password/{uid}/{token}/"
+                webhook_data = {
+                    "email": user.email,
+                    "reset_url": reset_url,
+                    "full_name": user.name or user.email.split('@')[0]
+                }
+                try:
+                    response = requests.post(settings.MAKE_WEBHOOK_URL, json=webhook_data)
+                    response.raise_for_status()
+                    return Response({"detail": "Password reset email sent."}, status=status.HTTP_200_OK)
+                except requests.RequestException as e:
+                    return Response({"detail": f"Failed to send email: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            except User.DoesNotExist:
+                return Response({"detail": "Email not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ResetPasswordView(APIView):
+    permission_classes = [AllowAny]
+    def post(self, request):
+        serializer = ResetPasswordSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                uid = force_str(urlsafe_base64_decode(serializer.validated_data['uid']))
+                user = User.objects.get(pk=uid)
+                token = serializer.validated_data['token']
+                token_generator = PasswordResetTokenGenerator()
+                if token_generator.check_token(user, token):
+                    user.set_password(serializer.validated_data['new_password'])
+                    user.save()
+                    return Response({"detail": "Password reset successfully."}, status=status.HTTP_200_OK)
+                return Response({"detail": "Invalid or expired token."}, status=status.HTTP_400_BAD_REQUEST)
+            except (User.DoesNotExist, ValueError):
+                return Response({"detail": "Invalid user or token."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+
+
+class UpdateLocationView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request):
+        latitude = request.data.get('latitude')
+        longitude = request.data.get('longitude')
+        if not latitude or not longitude:
+            return Response(
+                {'error': 'Latitude and longitude are required'},
+                status=400
+            )
+        try:
+            response = requests.get(
+                f'https://nominatim.openstreetmap.org/reverse?format=json&lat={latitude}&lon={longitude}',
+                headers={'User-Agent': 'KenyonLTD/1.0 (contact@kenyonltd.com)'}
+            )
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"[UpdateLocationView] Nominatim response: {data}")
+            state = data.get('address', {}).get('state', '') or data.get('address', {}).get('city', '')
+            normalized_state = state.replace(' State', '').strip()
+            matched_state = STATE_VARIATIONS.get(normalized_state, None) or STATE_VARIATIONS.get(state, None)
+            if not matched_state:
+                state_names = [short_name for short_name, _ in NIGERIAN_STATES]
+                result = process.extractOne(normalized_state, state_names, score_cutoff=60)
+                matched_state, score = result if result else ('Lagos', 0)
+            else:
+                score = 'exact'
+            profile, _ = UserProfile.objects.get_or_create(user=request.user)
+            profile.city = data.get('address', {}).get('city') or data.get('address', {}).get('town') or ''
+            profile.state = matched_state
+            profile.last_location_update = timezone.now()
+            profile.save()
+            logger.info(f"[UpdateLocationView] Updated location for user {request.user}: city={profile.city}, state={matched_state}, score={score}")
+            return Response({'city': profile.city, 'state': profile.state}, status=200)
+        except requests.RequestException as e:
+            logger.error(f"[UpdateLocationView] Failed to fetch location data: {str(e)}")
+            if response.status_code == 403:
+                logger.warning("[UpdateLocationView] Nominatim 403 Forbidden: Check User-Agent or rate limits")
+            return Response(
+                {'error': f'Failed to fetch location data: {str(e)}'},
+                status=500
+            )
+
+
+
+
+
+class ApiKeyViewSet(viewsets.ModelViewSet):
+    queryset = ApiKey.objects.all()
+    serializer_class = ApiKeySerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        logger.debug(f"[ApiKeyViewSet] Fetching API keys for user: {self.request.user.email}")
+        return ApiKey.objects.filter(user=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        logger.debug(f"[ApiKeyViewSet] User {request.user.email} attempting to generate API key. Role: {request.user.role}")
+        # Check permission
+        try:
+            action_perm = ActionPermission.objects.get(action_name='generate_api_key')
+            user_level = ROLE_LEVELS.get(request.user.role.lower(), 0)
+            required_level = ROLE_LEVELS.get(action_perm.min_role.lower(), 1)
+            logger.debug(f"[ApiKeyViewSet] User level: {user_level}, Required level: {required_level}")
+            if user_level < required_level:
+                logger.warning(f"[ApiKeyViewSet] Permission denied for user {request.user.email}: requires {action_perm.min_role}")
+                return Response(
+                    {"error": f"Permission denied: requires {action_perm.min_role} role"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        except ActionPermission.DoesNotExist:
+            logger.error(f"[ApiKeyViewSet] ActionPermission for 'generate_api_key' not found")
+            return Response(
+                {"error": "Action permission not configured for generate_api_key"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # Validate serializer
+        serializer = self.get_serializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except serializers.ValidationError as e:
+            logger.error(f"[ApiKeyViewSet] Serializer validation failed: {str(e)}")
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create API key
+        try:
+            key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(43))
+            api_key = ApiKey.objects.create(
+                user=request.user,
+                name=serializer.validated_data.get('name', 'API Key'),
+                key=key,
+                created_by=request.user,
+                is_active=True,
+                is_viewed=False
+            )
+            logger.debug(f"[ApiKeyViewSet] Generated API key for user {request.user.email}: {api_key.name}")
+            return Response(
+                {"key": api_key.key, "name": api_key.name},
+                status=status.HTTP_201_CREATED
+            )
+        except Exception as e:
+            logger.error(f"[ApiKeyViewSet] Failed to create API key: {str(e)}")
+            return Response(
+                {"error": f"Failed to create API key: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        logger.debug(f"[ApiKeyViewSet] User {request.user.email} attempting to delete API key")
+        try:
+            action_perm = ActionPermission.objects.get(action_name='delete_api_key')
+            user_level = ROLE_LEVELS.get(request.user.role.lower(), 0)
+            required_level = ROLE_LEVELS.get(action_perm.min_role.lower(), 1)
+            if user_level < required_level:
+                logger.warning(f"[ApiKeyViewSet] Permission denied for user {request.user.email}: requires {action_perm.min_role}")
+                return Response(
+                    {"error": f"Permission denied: requires {action_perm.min_role} role"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        except ActionPermission.DoesNotExist:
+            logger.error(f"[ApiKeyViewSet] ActionPermission for 'delete_api_key' not found")
+            return Response(
+                {"error": "Action permission not configured for delete_api_key"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    def retrieve(self, request, *args, **kwargs):
+        logger.debug(f"[ApiKeyViewSet] User {request.user.email} attempting to view API key")
+        try:
+            action_perm = ActionPermission.objects.get(action_name='view_api_key')
+            user_level = ROLE_LEVELS.get(request.user.role.lower(), 0)
+            required_level = ROLE_LEVELS.get(action_perm.min_role.lower(), 1)
+            if user_level < required_level:
+                logger.warning(f"[ApiKeyViewSet] Permission denied for user {request.user.email}: requires {action_perm.min_role}")
+                return Response(
+                    {"error": f"Permission denied: requires {action_perm.min_role} role"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        except ActionPermission.DoesNotExist:
+            logger.error(f"[ApiKeyViewSet] ActionPermission for 'view_api_key' not found")
+            return Response(
+                {"error": "Action permission not configured for view_api_key"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        return super().retrieve(request, *args, **kwargs)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+urls.py:
+#accounts/urls,py
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import (
+    MeView, CustomTokenObtainPairView, RegisterView, UserView,
+    ChangePasswordView, UserListView, AdminCreateUserView,
+    AdminDeleteUserView, UserProfileView, ProfilePictureUploadView, LogoutView,
+    PagePermissionViewSet, ActionPermissionViewSet, page_allowed, action_allowed,
+    ForgotPasswordView, ResetPasswordView, UpdateLocationView, ApiKeyViewSet
+)
+
+router = DefaultRouter()
+router.register(r'page-permissions', PagePermissionViewSet, basename='page-permissions')
+router.register(r'action-permissions', ActionPermissionViewSet, basename='action-permissions')
+router.register(r'api-keys', ApiKeyViewSet, basename='api-key')
+
+urlpatterns = [
+    path('me/', MeView.as_view(), name='me'),
+    path('login/', CustomTokenObtainPairView.as_view(), name='login'),
+    path('register/', RegisterView.as_view(), name='register'),
+    path('user/', UserView.as_view(), name='user'),
+    path('change-password/', ChangePasswordView.as_view(), name='change-password'),
+    path('users/', UserListView.as_view(), name='users'),
+    path('admin/create-user/', AdminCreateUserView.as_view(), name='admin-create-user'),
+    path('admin/delete-user/<int:id>/', AdminDeleteUserView.as_view(), name='admin-delete-user'),
+    path('profile/', UserProfileView.as_view(), name='profile'),  # Updated path
+    path('profile/upload/', ProfilePictureUploadView.as_view(), name='profile-upload'),
+    path('logout/', LogoutView.as_view(), name='logout'),
+    path('forgot-password/', ForgotPasswordView.as_view(), name='forgot-password'),
+    path('reset-password/', ResetPasswordView.as_view(), name='reset-password'),
+    path('update_location/', UpdateLocationView.as_view(), name='update_location'),  # Updated path
+    path('permissions/page/<str:page_name>/', page_allowed, name='page-allowed'),
+    path('permissions/action/<str:action_name>/', action_allowed, name='action-allowed'),
+    path('', include(router.urls)),
+]
+
+
+
+
+
+
+
+
+
+
+
+
+
+frontend user.jsx:
+// src/pages/UserManagement.jsx
+import React, { useState, useEffect } from "react";
+import {
+  Container,
+  Paper,
+  Box,
+  Typography,
+  Button,
+  TextField,
+  InputAdornment,
+  Table,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableBody,
+  TableContainer,
+  Pagination,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Grid,
+  MenuItem,
+  Alert,
+} from "@mui/material";
+import SearchIcon from "@mui/icons-material/Search";
+import PersonAddIcon from "@mui/icons-material/PersonAdd";
+import DeleteIcon from "@mui/icons-material/Delete";
+import EditIcon from "@mui/icons-material/Edit";
+import api from "../api";
+
+// Role options (match backend roles)
+const ROLE_OPTIONS = [
+  { value: "staff", label: "Staff" },
+  { value: "finance_manager", label: "Finance Manager" },
+  { value: "operations_manager", label: "Operations Manager" },
+  { value: "md", label: "Managing Director" },
+  { value: "admin", label: "Admin" },
+];
+
+// Inventory permission keys (must match accounts/models.py)
+const INVENTORY_PAGES = [
+  "inventory_metrics",
+  "storage_bins",
+  "expired_items",
+  "items",
+  "stock_records",
+  "expiry_tracked_items",
+];
+
+const INVENTORY_ACTIONS = [
+  "create_storage_bin",
+  "create_item",
+  "create_stock_record",
+  "create_expiry_tracked_item",
+  "update_storage_bin",
+  "update_item",
+  "update_stock_record",
+  "update_expiry_tracked_item",
+  "delete_item",
+  "delete_storage_bin",
+  "delete_stock_record",
+  "delete_expiry_tracked_item",
+];
+
+// Procurement permission keys (must match accounts/models.py)
+const PROCUREMENT_PAGES = [
+  "requisitions",
+  "purchase_orders",
+  "po_items",
+  "receiving",
+  "goods_receipts",
+  "vendors",
+];
+
+const PROCUREMENT_ACTIONS = [
+  "create_requisition",
+  "approve_requisition",
+  "create_purchase_order",
+  "approve_purchase_order",
+  "reject_purchase_order",
+  "counter_purchase_order",
+  "create_po_item",
+  "create_receiving",
+  "create_goods_receipt",
+  "add_vendor",
+  "delete_vendor",
+];
+
+// Receipt permission keys (must match accounts/models.py)
+const RECEIPT_PAGES = [
+  "receipt_archive",
+  "stock_receipts",
+  "signing_receipts",
+];
+
+const RECEIPT_ACTIONS = [
+  "create_receipt",
+  "create_stock_receipt",
+  "create_signing_receipt",
+];
+
+// Finance permission keys (must match accounts/models.py)
+const FINANCE_PAGES = [
+  "invoices",
+  "financial_metrics",
+];
+
+const FINANCE_ACTIONS = [
+  "create_invoice",
+  "create_payment",
+];
+
+// Rentals permission keys (must match accounts/models.py)
+const RENTALS_PAGES = [
+  "rentals_active",
+  "rentals_equipment",
+  "rentals_payments",
+];
+
+const RENTALS_ACTIONS = [
+  "create_rental",
+  "create_equipment",
+  "create_payment",
+];
+
+// Analytics permission keys (must match accounts/models.py)
+const ANALYTICS_PAGES = [
+  "analytics_dwell",
+  "analytics_eoq",
+  "analytics_stock",
+  "analytics_dashboard",
+];
+
+const ANALYTICS_ACTIONS = [
+  "create_dwell",
+  "create_eoq",
+  "create_stock_analytics",
+];
+
+function friendlyLabelFromKey(key) {
+  return key
+    .split("_")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+export default function UserManagement() {
+  const [users, setUsers] = useState([]);
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [role, setRole] = useState("");
+  const [formOpen, setFormOpen] = useState(false);
+  const [form, setForm] = useState({ name: "", email: "", role: "staff" });
+  const [formError, setFormError] = useState("");
+  const [formSuccess, setFormSuccess] = useState("");
+  const [permissionsOpen, setPermissionsOpen] = useState(false);
+  const [permError, setPermError] = useState("");
+  const [permSuccess, setPermSuccess] = useState("");
+  const [permLoading, setPermLoading] = useState(false);
+
+  // Permissions state for all modules
+  const [invPagePerms, setInvPagePerms] = useState([]);
+  const [invActionPerms, setInvActionPerms] = useState([]);
+  const [proPagePerms, setProPagePerms] = useState([]);
+  const [proActionPerms, setProActionPerms] = useState([]);
+  const [recPagePerms, setRecPagePerms] = useState([]);
+  const [recActionPerms, setRecActionPerms] = useState([]);
+  const [finPagePerms, setFinPagePerms] = useState([]);
+  const [finActionPerms, setFinActionPerms] = useState([]);
+  const [rentPagePerms, setRentPagePerms] = useState([]);
+  const [rentActionPerms, setRentActionPerms] = useState([]);
+  const [anaPagePerms, setAnaPagePerms] = useState([]);
+  const [anaActionPerms, setAnaActionPerms] = useState([]);
+
+  const [resolvedPageEndpoint, setResolvedPageEndpoint] = useState(null);
+  const [resolvedActionEndpoint, setResolvedActionEndpoint] = useState(null);
+
+  const itemsPerPage = 10;
+
+  useEffect(() => {
+    api
+      .get("auth/me/")
+      .then((res) => {
+        setRole(res.data.role);
+        if (res.data.role === "admin") {
+          fetchUsers();
+        } else {
+          setUsers([]); // Ensure users is an array even if not admin
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to fetch current user:", err);
+        setUsers([]); // Fallback to empty array on error
+      });
+  }, []);
+
+  const fetchUsers = async () => {
+    try {
+      const res = await api.get("auth/users/");
+      // Ensure res.data is an array; fallback to empty array if not
+      setUsers(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      console.error("Failed to fetch users:", err);
+      setUsers([]); // Fallback to empty array on error
+    }
+  };
+
+  const handleCreateUser = async () => {
+    setFormError("");
+    setFormSuccess("");
+    if (!form.name || !form.email || !form.role) {
+      setFormError("Please fill in all fields.");
+      return;
+    }
+    try {
+      const payload = {
+        name: form.name.trim(),
+        email: form.email.trim(),
+        role: form.role,
+        password: "Password10",
+      };
+      await api.post("auth/register/", payload);
+      setFormSuccess("✅ User created successfully");
+      setForm({ name: "", email: "", role: "staff" });
+      fetchUsers();
+    } catch (err) {
+      const errMsg =
+        err.response?.data?.email ||
+        err.response?.data?.detail ||
+        JSON.stringify(err.response?.data) ||
+        "❌ Failed to create user.";
+      setFormError(errMsg);
+    }
+  };
+
+  const handleDeleteUser = async (id) => {
+    if (!window.confirm("Are you sure you want to delete this user?")) return;
+    try {
+      await api.delete(`auth/users/${id}/`);
+      setUsers((prev) => prev.filter((u) => u.id !== id));
+    } catch (err) {
+      alert("❌ Failed to delete user.");
+      console.error(err);
+    }
+  };
+
+  // Permissions handling
+  const handleOpenPermissions = async () => {
+    setPermError("");
+    setPermSuccess("");
+    setPermissionsOpen(true);
+    await loadPermissions();
+  };
+
+  const ensureTrailingSlash = (p) => (p.endsWith("/") ? p : `${p}/`);
+
+  const tryGet = async (candidates) => {
+    for (const c of candidates) {
+      const path = ensureTrailingSlash(c);
+      try {
+        const res = await api.get(path);
+        return { res, path };
+      } catch (err) {
+        if (err.response && err.response.status === 404) {
+          continue;
+        } else {
+          throw err;
+        }
+      }
+    }
+    const e = new Error("Not found");
+    e.notFound = true;
+    throw e;
+  };
+
+  const loadPermissions = async () => {
+    setPermError("");
+    setPermSuccess("");
+    setPermLoading(true);
+
+    const pageCandidates = ["auth/page-permissions", "page-permissions"];
+    const actionCandidates = ["auth/action-permissions", "action-permissions"];
+
+    try {
+      const { res: pagesRes, path: pagesPath } = await tryGet(pageCandidates);
+      const { res: actionsRes, path: actionsPath } = await tryGet(actionCandidates);
+
+      const pagesFromServer = Array.isArray(pagesRes.data)
+        ? pagesRes.data
+        : pagesRes.data.results || [];
+
+      const actionsFromServer = Array.isArray(actionsRes.data)
+        ? actionsRes.data
+        : actionsRes.data.results || [];
+
+      // Build Inventory arrays
+      const invPages = INVENTORY_PAGES.map((key) => {
+        const found = pagesFromServer.find((p) => p.page_name === key);
+        return found
+          ? { id: found.id, page_name: found.page_name, min_role: found.min_role }
+          : { id: null, page_name: key, min_role: "staff" };
+      });
+      const invActions = INVENTORY_ACTIONS.map((key) => {
+        const found = actionsFromServer.find((a) => a.action_name === key);
+        return found
+          ? { id: found.id, action_name: found.action_name, min_role: found.min_role }
+          : { id: null, action_name: key, min_role: "staff" };
+      });
+
+      // Build Procurement arrays
+      const proPages = PROCUREMENT_PAGES.map((key) => {
+        const found = pagesFromServer.find((p) => p.page_name === key);
+        return found
+          ? { id: found.id, page_name: found.page_name, min_role: found.min_role }
+          : { id: null, page_name: key, min_role: "staff" };
+      });
+      const proActions = PROCUREMENT_ACTIONS.map((key) => {
+        const found = actionsFromServer.find((a) => a.action_name === key);
+        return found
+          ? { id: found.id, action_name: found.action_name, min_role: found.min_role }
+          : { id: null, action_name: key, min_role: "staff" };
+      });
+
+      // Build Receipt arrays
+      const recPages = RECEIPT_PAGES.map((key) => {
+        const found = pagesFromServer.find((p) => p.page_name === key);
+        return found
+          ? { id: found.id, page_name: found.page_name, min_role: found.min_role }
+          : { id: null, page_name: key, min_role: "staff" };
+      });
+      const recActions = RECEIPT_ACTIONS.map((key) => {
+        const found = actionsFromServer.find((a) => a.action_name === key);
+        return found
+          ? { id: found.id, action_name: found.action_name, min_role: found.min_role }
+          : { id: null, action_name: key, min_role: "staff" };
+      });
+
+      // Build Finance arrays
+      const finPages = FINANCE_PAGES.map((key) => {
+        const found = pagesFromServer.find((p) => p.page_name === key);
+        return found
+          ? { id: found.id, page_name: found.page_name, min_role: found.min_role }
+          : { id: null, page_name: key, min_role: "staff" };
+      });
+      const finActions = FINANCE_ACTIONS.map((key) => {
+        const found = actionsFromServer.find((a) => a.action_name === key);
+        return found
+          ? { id: found.id, action_name: found.action_name, min_role: found.min_role }
+          : { id: null, action_name: key, min_role: "staff" };
+      });
+
+      // Build Rentals arrays
+      const rentPages = RENTALS_PAGES.map((key) => {
+        const found = pagesFromServer.find((p) => p.page_name === key);
+        return found
+          ? { id: found.id, page_name: found.page_name, min_role: found.min_role }
+          : { id: null, page_name: key, min_role: "staff" };
+      });
+      const rentActions = RENTALS_ACTIONS.map((key) => {
+        const found = actionsFromServer.find((a) => a.action_name === key);
+        return found
+          ? { id: found.id, action_name: found.action_name, min_role: found.min_role }
+          : { id: null, action_name: key, min_role: "staff" };
+      });
+
+      // Build Analytics arrays
+      const anaPages = ANALYTICS_PAGES.map((key) => {
+        const found = pagesFromServer.find((p) => p.page_name === key);
+        return found
+          ? { id: found.id, page_name: found.page_name, min_role: found.min_role }
+          : { id: null, page_name: key, min_role: "staff" };
+      });
+      const anaActions = ANALYTICS_ACTIONS.map((key) => {
+        const found = actionsFromServer.find((a) => a.action_name === key);
+        return found
+          ? { id: found.id, action_name: found.action_name, min_role: found.min_role }
+          : { id: null, action_name: key, min_role: "staff" };
+      });
+
+      setInvPagePerms(invPages);
+      setInvActionPerms(invActions);
+      setProPagePerms(proPages);
+      setProActionPerms(proActions);
+      setRecPagePerms(recPages);
+      setRecActionPerms(recActions);
+      setFinPagePerms(finPages);
+      setFinActionPerms(finActions);
+      setRentPagePerms(rentPages);
+      setRentActionPerms(rentActions);
+      setAnaPagePerms(anaPages);
+      setAnaActionPerms(anaActions);
+
+      setResolvedPageEndpoint(ensureTrailingSlash(pagesPath));
+      setResolvedActionEndpoint(ensureTrailingSlash(actionsPath));
+    } catch (err) {
+      console.error("Failed to load permissions:", err);
+      if (err.notFound) {
+        setPermError("Permissions endpoints not found (404). Check backend routing.");
+      } else if (err.response && (err.response.status === 401 || err.response.status === 403)) {
+        setPermError("Unauthorized – you need admin access.");
+      } else {
+        setPermError("Failed to load permissions. Please refresh and try again.");
+      }
+      setInvPagePerms(INVENTORY_PAGES.map((k) => ({ id: null, page_name: k, min_role: "staff" })));
+      setInvActionPerms(INVENTORY_ACTIONS.map((k) => ({ id: null, action_name: k, min_role: "staff" })));
+      setProPagePerms(PROCUREMENT_PAGES.map((k) => ({ id: null, page_name: k, min_role: "staff" })));
+      setProActionPerms(PROCUREMENT_ACTIONS.map((k) => ({ id: null, action_name: k, min_role: "staff" })));
+      setRecPagePerms(RECEIPT_PAGES.map((k) => ({ id: null, page_name: k, min_role: "staff" })));
+      setRecActionPerms(RECEIPT_ACTIONS.map((k) => ({ id: null, action_name: k, min_role: "staff" })));
+      setFinPagePerms(FINANCE_PAGES.map((k) => ({ id: null, page_name: k, min_role: "staff" })));
+      setFinActionPerms(FINANCE_ACTIONS.map((k) => ({ id: null, action_name: k, min_role: "staff" })));
+      setRentPagePerms(RENTALS_PAGES.map((k) => ({ id: null, page_name: k, min_role: "staff" })));
+      setRentActionPerms(RENTALS_ACTIONS.map((k) => ({ id: null, action_name: k, min_role: "staff" })));
+      setAnaPagePerms(ANALYTICS_PAGES.map((k) => ({ id: null, page_name: k, min_role: "staff" })));
+      setAnaActionPerms(ANALYTICS_ACTIONS.map((k) => ({ id: null, action_name: k, min_role: "staff" })));
+    } finally {
+      setPermLoading(false);
+    }
+  };
+
+  // Change handlers (Inventory)
+  const handleInvPagePermChange = (pageName, newRole) => {
+    setInvPagePerms((prev) =>
+      prev.map((p) => (p.page_name === pageName ? { ...p, min_role: newRole } : p))
+    );
+  };
+  const handleInvActionPermChange = (actionName, newRole) => {
+    setInvActionPerms((prev) =>
+      prev.map((a) => (a.action_name === actionName ? { ...a, min_role: newRole } : a))
+    );
+  };
+
+  // Change handlers (Procurement)
+  const handleProPagePermChange = (pageName, newRole) => {
+    setProPagePerms((prev) =>
+      prev.map((p) => (p.page_name === pageName ? { ...p, min_role: newRole } : p))
+    );
+  };
+  const handleProActionPermChange = (actionName, newRole) => {
+    setProActionPerms((prev) =>
+      prev.map((a) => (a.action_name === actionName ? { ...a, min_role: newRole } : a))
+    );
+  };
+
+  // Change handlers (Receipt)
+  const handleRecPagePermChange = (pageName, newRole) => {
+    setRecPagePerms((prev) =>
+      prev.map((p) => (p.page_name === pageName ? { ...p, min_role: newRole } : p))
+    );
+  };
+  const handleRecActionPermChange = (actionName, newRole) => {
+    setRecActionPerms((prev) =>
+      prev.map((a) => (a.action_name === actionName ? { ...a, min_role: newRole } : a))
+    );
+  };
+
+  // Change handlers (Finance)
+  const handleFinPagePermChange = (pageName, newRole) => {
+    setFinPagePerms((prev) =>
+      prev.map((p) => (p.page_name === pageName ? { ...p, min_role: newRole } : p))
+    );
+  };
+  const handleFinActionPermChange = (actionName, newRole) => {
+    setFinActionPerms((prev) =>
+      prev.map((a) => (a.action_name === actionName ? { ...a, min_role: newRole } : a))
+    );
+  };
+
+  // Change handlers (Rentals)
+  const handleRentPagePermChange = (pageName, newRole) => {
+    setRentPagePerms((prev) =>
+      prev.map((p) => (p.page_name === pageName ? { ...p, min_role: newRole } : p))
+    );
+  };
+  const handleRentActionPermChange = (actionName, newRole) => {
+    setRentActionPerms((prev) =>
+      prev.map((a) => (a.action_name === actionName ? { ...a, min_role: newRole } : a))
+    );
+  };
+
+  // Change handlers (Analytics)
+  const handleAnaPagePermChange = (pageName, newRole) => {
+    setAnaPagePerms((prev) =>
+      prev.map((p) => (p.page_name === pageName ? { ...p, min_role: newRole } : p))
+    );
+  };
+  const handleAnaActionPermChange = (actionName, newRole) => {
+    setAnaActionPerms((prev) =>
+      prev.map((a) => (a.action_name === actionName ? { ...a, min_role: newRole } : a))
+    );
+  };
+
+  const handleUpdatePermissions = async () => {
+    setPermError("");
+    setPermSuccess("");
+    setPermLoading(true);
+
+    try {
+      let pageEndpoint = resolvedPageEndpoint;
+      let actionEndpoint = resolvedActionEndpoint;
+
+      if (!pageEndpoint || !actionEndpoint) {
+        const pageCandidates = ["auth/page-permissions", "page-permissions"];
+        const actionCandidates = ["auth/action-permissions", "action-permissions"];
+        try {
+          const { path: pagesPath } = await tryGet(pageCandidates);
+          const { path: actionsPath } = await tryGet(actionCandidates);
+          pageEndpoint = ensureTrailingSlash(pagesPath);
+          actionEndpoint = ensureTrailingSlash(actionsPath);
+          setResolvedPageEndpoint(pageEndpoint);
+          setResolvedActionEndpoint(actionEndpoint);
+        } catch (err) {
+          throw new Error("Could not resolve permissions endpoints for update. Check backend routing.");
+        }
+      }
+
+      const requests = [];
+
+      // Patch/create Inventory pages
+      invPagePerms.forEach((p) => {
+        if (p.id) {
+          requests.push(api.patch(`${pageEndpoint}${p.id}/`, { min_role: p.min_role }));
+        } else {
+          requests.push(api.post(pageEndpoint, { page_name: p.page_name, min_role: p.min_role }));
+        }
+      });
+
+      // Patch/create Inventory actions
+      invActionPerms.forEach((a) => {
+        if (a.id) {
+          requests.push(api.patch(`${actionEndpoint}${a.id}/`, { min_role: a.min_role }));
+        } else {
+          requests.push(api.post(actionEndpoint, { action_name: a.action_name, min_role: a.min_role }));
+        }
+      });
+
+      // Patch/create Procurement pages
+      proPagePerms.forEach((p) => {
+        if (p.id) {
+          requests.push(api.patch(`${pageEndpoint}${p.id}/`, { min_role: p.min_role }));
+        } else {
+          requests.push(api.post(pageEndpoint, { page_name: p.page_name, min_role: p.min_role }));
+        }
+      });
+
+      // Patch/create Procurement actions
+      proActionPerms.forEach((a) => {
+        if (a.id) {
+          requests.push(api.patch(`${actionEndpoint}${a.id}/`, { min_role: a.min_role }));
+        } else {
+          requests.push(api.post(actionEndpoint, { action_name: a.action_name, min_role: a.min_role }));
+        }
+      });
+
+      // Patch/create Receipt pages
+      recPagePerms.forEach((p) => {
+        if (p.id) {
+          requests.push(api.patch(`${pageEndpoint}${p.id}/`, { min_role: p.min_role }));
+        } else {
+          requests.push(api.post(pageEndpoint, { page_name: p.page_name, min_role: p.min_role }));
+        }
+      });
+
+      // Patch/create Receipt actions
+      recActionPerms.forEach((a) => {
+        if (a.id) {
+          requests.push(api.patch(`${actionEndpoint}${a.id}/`, { min_role: a.min_role }));
+        } else {
+          requests.push(api.post(actionEndpoint, { action_name: a.action_name, min_role: a.min_role }));
+        }
+      });
+
+      // Patch/create Finance pages
+      finPagePerms.forEach((p) => {
+        if (p.id) {
+          requests.push(api.patch(`${pageEndpoint}${p.id}/`, { min_role: p.min_role }));
+        } else {
+          requests.push(api.post(pageEndpoint, { page_name: p.page_name, min_role: p.min_role }));
+        }
+      });
+
+      // Patch/create Finance actions
+      finActionPerms.forEach((a) => {
+        if (a.id) {
+          requests.push(api.patch(`${actionEndpoint}${a.id}/`, { min_role: a.min_role }));
+        } else {
+          requests.push(api.post(actionEndpoint, { action_name: a.action_name, min_role: a.min_role }));
+        }
+      });
+
+      // Patch/create Rentals pages
+      rentPagePerms.forEach((p) => {
+        if (p.id) {
+          requests.push(api.patch(`${pageEndpoint}${p.id}/`, { min_role: p.min_role }));
+        } else {
+          requests.push(api.post(pageEndpoint, { page_name: p.page_name, min_role: p.min_role }));
+        }
+      });
+
+      // Patch/create Rentals actions
+      rentActionPerms.forEach((a) => {
+        if (a.id) {
+          requests.push(api.patch(`${actionEndpoint}${a.id}/`, { min_role: a.min_role }));
+        } else {
+          requests.push(api.post(actionEndpoint, { action_name: a.action_name, min_role: a.min_role }));
+        }
+      });
+
+      // Patch/create Analytics pages
+      anaPagePerms.forEach((p) => {
+        if (p.id) {
+          requests.push(api.patch(`${pageEndpoint}${p.id}/`, { min_role: p.min_role }));
+        } else {
+          requests.push(api.post(pageEndpoint, { page_name: p.page_name, min_role: p.min_role }));
+        }
+      });
+
+      // Patch/create Analytics actions
+      anaActionPerms.forEach((a) => {
+        if (a.id) {
+          requests.push(api.patch(`${actionEndpoint}${a.id}/`, { min_role: a.min_role }));
+        } else {
+          requests.push(api.post(actionEndpoint, { action_name: a.action_name, min_role: a.min_role }));
+        }
+      });
+
+      await Promise.all(requests);
+      await loadPermissions();
+      setPermSuccess("✅ Permissions updated successfully");
+    } catch (err) {
+      console.error("Failed to update permissions:", err);
+      const serverMsg =
+        err.response?.data?.detail ||
+        (err.response?.data && JSON.stringify(err.response.data)) ||
+        err.message ||
+        "Failed to update permissions.";
+      setPermError(`❌ ${serverMsg}`);
+    } finally {
+      setPermLoading(false);
+    }
+  };
+
+  // Ensure users is an array before calling filter
+  const filtered = Array.isArray(users)
+    ? users.filter(
+        (user) =>
+          user.full_name?.toLowerCase().includes(search.toLowerCase()) ||
+          user.email?.toLowerCase().includes(search.toLowerCase()) ||
+          user.role?.toLowerCase().includes(search.toLowerCase())
+      )
+    : [];
+
+  const paginated = filtered.slice((page - 1) * itemsPerPage, page * itemsPerPage);
+
+  if (role && role !== "admin") {
+    return (
+      <Container maxWidth="md" sx={{ mt: 4 }}>
+        <Alert severity="error">Access Denied – Admins only</Alert>
+      </Container>
+    );
+  }
+
+  return (
+    <Container maxWidth="lg" sx={{ mt: 4 }}>
+      <Paper elevation={3} sx={{ p: 4 }}>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+          <Box>
+            <Typography variant="h4">User Management</Typography>
+            <Typography variant="subtitle1">Manage all system users including roles and status</Typography>
+          </Box>
+          <Box display="flex" gap={2}>
+            <Button variant="outlined" startIcon={<EditIcon />} onClick={handleOpenPermissions}>
+              Edit User Permissions
+            </Button>
+            <Button variant="contained" startIcon={<PersonAddIcon />} onClick={() => setFormOpen(true)}>
+              Add User
+            </Button>
+          </Box>
+        </Box>
+
+        <Box display="flex" justifyContent="flex-end" mb={2}>
+          <TextField
+            placeholder="Search users..."
+            variant="outlined"
+            size="small"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon />
+                </InputAdornment>
+              ),
+            }}
+          />
+        </Box>
+
+        <TableContainer>
+          <Table>
+            <TableHead>
+              <TableRow>
+                <TableCell>S/N</TableCell>
+                <TableCell>Name</TableCell>
+                <TableCell>Email</TableCell>
+                <TableCell>Role</TableCell>
+                <TableCell>Status</TableCell>
+                <TableCell>Action</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {paginated.length > 0 ? (
+                paginated.map((user, index) => (
+                  <TableRow key={user.id}>
+                    <TableCell>{(page - 1) * itemsPerPage + index + 1}</TableCell>
+                    <TableCell>{user.full_name}</TableCell>
+                    <TableCell>{user.email}</TableCell>
+                    <TableCell>{user.role}</TableCell>
+                    <TableCell>{user.status ?? "Active"}</TableCell>
+                    <TableCell>
+                      <Button color="error" startIcon={<DeleteIcon />} onClick={() => handleDeleteUser(user.id)}>
+                        Delete
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell colSpan={6} align="center">
+                    No matching users found.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+
+        <Box display="flex" justifyContent="center" mt={3}>
+          <Pagination
+            count={Math.max(1, Math.ceil(filtered.length / itemsPerPage))}
+            page={page}
+            onChange={(_, value) => setPage(value)}
+            color="primary"
+          />
+        </Box>
+      </Paper>
+
+      <Dialog open={formOpen} onClose={() => setFormOpen(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Create New User</DialogTitle>
+        <DialogContent>
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            <Grid item xs={12}>
+              <TextField label="Full Name" name="name" fullWidth value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField label="Email" name="email" fullWidth value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField label="Role" name="role" select fullWidth value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+                {ROLE_OPTIONS.map((r) => (
+                  <MenuItem key={r.value} value={r.value}>
+                    {r.label}
+                  </MenuItem>
+                ))}
+              </TextField>
+            </Grid>
+          </Grid>
+          {formError && (
+            <Alert severity="error" sx={{ mt: 2 }}>
+              {formError}
+            </Alert>
+          )}
+          {formSuccess && (
+            <Alert severity="success" sx={{ mt: 2 }}>
+              {formSuccess}
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setFormOpen(false)}>Cancel</Button>
+          <Button onClick={handleCreateUser} variant="contained">
+            Create
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={permissionsOpen} onClose={() => setPermissionsOpen(false)} fullWidth maxWidth="md">
+        <DialogTitle>Edit User Permissions</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Control which roles can access specific pages and perform actions across all modules.
+            Select the minimum role required for each page or action. (Admin is the highest role.)
+          </Typography>
+
+          {permError && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {permError}
+            </Alert>
+          )}
+          {permSuccess && (
+            <Alert severity="success" sx={{ mb: 2 }}>
+              {permSuccess}
+            </Alert>
+          )}
+
+          {/* Inventory Section */}
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h6" gutterBottom>
+              Inventory
+            </Typography>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Pages
+            </Typography>
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              {invPagePerms.map((p) => (
+                <Grid item xs={12} sm={6} key={p.page_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(p.page_name)}
+                    helperText={p.page_name}
+                    select
+                    fullWidth
+                    value={p.min_role}
+                    onChange={(e) => handleInvPagePermChange(p.page_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Actions
+            </Typography>
+            <Grid container spacing={2}>
+              {invActionPerms.map((a) => (
+                <Grid item xs={12} sm={6} key={a.action_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(a.action_name)}
+                    helperText={a.action_name}
+                    select
+                    fullWidth
+                    value={a.min_role}
+                    onChange={(e) => handleInvActionPermChange(a.action_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+          </Box>
+
+          {/* Procurement Section */}
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h6" gutterBottom>
+              Procurement
+            </Typography>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Pages
+            </Typography>
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              {proPagePerms.map((p) => (
+                <Grid item xs={12} sm={6} key={p.page_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(p.page_name)}
+                    helperText={p.page_name}
+                    select
+                    fullWidth
+                    value={p.min_role}
+                    onChange={(e) => handleProPagePermChange(p.page_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Actions
+            </Typography>
+            <Grid container spacing={2}>
+              {proActionPerms.map((a) => (
+                <Grid item xs={12} sm={6} key={a.action_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(a.action_name)}
+                    helperText={a.action_name}
+                    select
+                    fullWidth
+                    value={a.min_role}
+                    onChange={(e) => handleProActionPermChange(a.action_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+          </Box>
+
+          {/* Receipt Section */}
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h6" gutterBottom>
+              Receipt
+            </Typography>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Pages
+            </Typography>
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              {recPagePerms.map((p) => (
+                <Grid item xs={12} sm={6} key={p.page_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(p.page_name)}
+                    helperText={p.page_name}
+                    select
+                    fullWidth
+                    value={p.min_role}
+                    onChange={(e) => handleRecPagePermChange(p.page_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Actions
+            </Typography>
+            <Grid container spacing={2}>
+              {recActionPerms.map((a) => (
+                <Grid item xs={12} sm={6} key={a.action_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(a.action_name)}
+                    helperText={a.action_name}
+                    select
+                    fullWidth
+                    value={a.min_role}
+                    onChange={(e) => handleRecActionPermChange(a.action_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+          </Box>
+
+          {/* Finance Section */}
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h6" gutterBottom>
+              Finance
+            </Typography>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Pages
+            </Typography>
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              {finPagePerms.map((p) => (
+                <Grid item xs={12} sm={6} key={p.page_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(p.page_name)}
+                    helperText={p.page_name}
+                    select
+                    fullWidth
+                    value={p.min_role}
+                    onChange={(e) => handleFinPagePermChange(p.page_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Actions
+            </Typography>
+            <Grid container spacing={2}>
+              {finActionPerms.map((a) => (
+                <Grid item xs={12} sm={6} key={a.action_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(a.action_name)}
+                    helperText={a.action_name}
+                    select
+                    fullWidth
+                    value={a.min_role}
+                    onChange={(e) => handleFinActionPermChange(a.action_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+          </Box>
+
+          {/* Rentals Section */}
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h6" gutterBottom>
+              Rentals
+            </Typography>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Pages
+            </Typography>
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              {rentPagePerms.map((p) => (
+                <Grid item xs={12} sm={6} key={p.page_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(p.page_name)}
+                    helperText={p.page_name}
+                    select
+                    fullWidth
+                    value={p.min_role}
+                    onChange={(e) => handleRentPagePermChange(p.page_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Actions
+            </Typography>
+            <Grid container spacing={2}>
+              {rentActionPerms.map((a) => (
+                <Grid item xs={12} sm={6} key={a.action_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(a.action_name)}
+                    helperText={a.action_name}
+                    select
+                    fullWidth
+                    value={a.min_role}
+                    onChange={(e) => handleRentActionPermChange(a.action_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+          </Box>
+
+          {/* Analytics Section */}
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h6" gutterBottom>
+              Analytics
+            </Typography>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Pages
+            </Typography>
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              {anaPagePerms.map((p) => (
+                <Grid item xs={12} sm={6} key={p.page_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(p.page_name)}
+                    helperText={p.page_name}
+                    select
+                    fullWidth
+                    value={p.min_role}
+                    onChange={(e) => handleAnaPagePermChange(p.page_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+            <Typography variant="subtitle1" sx={{ mt: 1, mb: 1 }}>
+              Actions
+            </Typography>
+            <Grid container spacing={2}>
+              {anaActionPerms.map((a) => (
+                <Grid item xs={12} sm={6} key={a.action_name}>
+                  <TextField
+                    label={friendlyLabelFromKey(a.action_name)}
+                    helperText={a.action_name}
+                    select
+                    fullWidth
+                    value={a.min_role}
+                    onChange={(e) => handleAnaActionPermChange(a.action_name, e.target.value)}
+                  >
+                    {ROLE_OPTIONS.map((r) => (
+                      <MenuItem key={r.value} value={r.value}>
+                        {r.label}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                </Grid>
+              ))}
+            </Grid>
+          </Box>
+        </DialogContent>
+
+        <DialogActions>
+          <Button onClick={() => setPermissionsOpen(false)}>Cancel</Button>
+          <Button onClick={handleUpdatePermissions} variant="contained" disabled={permLoading}>
+            {permLoading ? "Updating..." : "Update Permissions"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Container>
+  );
+}
