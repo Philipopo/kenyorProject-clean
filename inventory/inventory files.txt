@@ -608,7 +608,6 @@ class WarehouseReceiptSerializer(serializers.ModelSerializer):
 
 
 
-
 models.py:
 
 
@@ -1034,7 +1033,16 @@ class WarehouseReceipt(models.Model):
 
 
 
-views.py:
+
+
+
+
+
+
+
+
+
+
 import csv
 from django.conf import settings
 from rest_framework import viewsets, permissions, status
@@ -2214,6 +2222,9 @@ class WarehouseReceiptViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         check_permission(self.request.user, action="delete_warehouse_receipt")
         instance.delete()
+
+
+
 
 
 

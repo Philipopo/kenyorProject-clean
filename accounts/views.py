@@ -403,6 +403,55 @@ class UpdateLocationView(APIView):
 
 
 
+class AdminUpdateUserRoleView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, user_id):
+        if request.user.role != 'admin':
+            return Response({"detail": "Only admin users can update roles."}, status=403)
+        
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=404)
+
+        new_role = request.data.get('role')
+        if not new_role:
+            return Response({"detail": "Role is required."}, status=400)
+
+        # Get valid roles from the User model's 'role' field choices
+        allowed_roles = [choice[0] for choice in User._meta.get_field('role').choices]
+        if new_role not in allowed_roles:
+            return Response({"detail": "Invalid role."}, status=400)
+
+        user.role = new_role
+        user.save(update_fields=['role'])
+        return Response({"detail": f"Role updated to {new_role}."}, status=200)
+
+
+class AdminResetUserPasswordView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, user_id):
+        if request.user.role != 'admin':
+            return Response({"detail": "Only admin users can reset passwords."}, status=403)
+        
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=404)
+
+        new_password = request.data.get('new_password')
+        if not new_password or len(new_password) < 6:
+            return Response({"detail": "Password must be at least 6 characters."}, status=400)
+
+        user.set_password(new_password)
+        user.save(update_fields=[])  # password is handled by set_password
+        return Response({"detail": "Password reset successfully."}, status=200)
+
+
+
+
 class ApiKeyViewSet(viewsets.ModelViewSet):
     queryset = ApiKey.objects.all()
     serializer_class = ApiKeySerializer

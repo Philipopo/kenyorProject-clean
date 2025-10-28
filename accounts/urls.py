@@ -6,7 +6,7 @@ from .views import (
     ChangePasswordView, UserListView, AdminCreateUserView,
     AdminDeleteUserView, UserProfileView, ProfilePictureUploadView, LogoutView,
     PagePermissionViewSet, ActionPermissionViewSet, page_allowed, action_allowed,
-    ForgotPasswordView, ResetPasswordView, UpdateLocationView, ApiKeyViewSet
+    ForgotPasswordView, ResetPasswordView, UpdateLocationView, ApiKeyViewSet, AdminUpdateUserRoleView, AdminResetUserPasswordView
 )
 
 router = DefaultRouter()
@@ -21,6 +21,8 @@ urlpatterns = [
     path('user/', UserView.as_view(), name='user'),
     path('change-password/', ChangePasswordView.as_view(), name='change-password'),
     path('users/', UserListView.as_view(), name='users'),
+    path('admin/update-user-role/<int:user_id>/', AdminUpdateUserRoleView.as_view(), name='admin-update-user-role'),
+    path('admin/reset-user-password/<int:user_id>/', AdminResetUserPasswordView.as_view(), name='admin-reset-user-password'),
     path('admin/create-user/', AdminCreateUserView.as_view(), name='admin-create-user'),
     path('admin/delete-user/<int:id>/', AdminDeleteUserView.as_view(), name='admin-delete-user'),
     path('profile/', UserProfileView.as_view(), name='profile'),  # Updated path

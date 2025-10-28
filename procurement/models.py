@@ -7,6 +7,11 @@ import uuid
 
 User = get_user_model()
 
+CURRENCY_CHOICES = [
+    ('NGN', 'Nigerian Naira (₦)'),
+    ('USD', 'US Dollar ($)'),
+]
+
 class Vendor(models.Model):
     STAR_CHOICES = [(i, f"{i} Star{'s' if i > 1 else ''}") for i in range(1, 6)]
     STATUS_CHOICES = [
@@ -53,9 +58,7 @@ class Vendor(models.Model):
         }
 
 
-
 class ApprovalBoard(models.Model):
-    """Manages users who can approve requisitions and purchase orders"""
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='approval_board_memberships')
     can_approve_requisitions = models.BooleanField(default=False)
     can_approve_purchase_orders = models.BooleanField(default=False)
@@ -73,8 +76,6 @@ class ApprovalBoard(models.Model):
     def clean(self):
         if not (self.can_approve_requisitions or self.can_approve_purchase_orders):
             raise ValidationError("User must be able to approve at least one type of document.")
-
-
 
 
 class Requisition(models.Model):
@@ -103,6 +104,7 @@ class Requisition(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     approved_at = models.DateTimeField(null=True, blank=True)
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='NGN')
 
     class Meta:
         ordering = ['-created_at']
@@ -116,14 +118,12 @@ class Requisition(models.Model):
         return f"{self.code}: {self.department} ({self.status})"
 
     def can_approve(self, user):
-        """Check if user can approve this requisition using ApprovalBoard"""
         try:
             approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
             return approval_member.can_approve_requisitions
         except ApprovalBoard.DoesNotExist:
             return False
 
-    
 
 class RequisitionItem(models.Model):
     requisition = models.ForeignKey(Requisition, on_delete=models.CASCADE, related_name='items')
@@ -141,24 +141,12 @@ class RequisitionItem(models.Model):
         return f"{self.item.name} x {self.quantity}"
 
     def save(self, *args, **kwargs):
-        if self.unit_cost and self.quantity:
+        # Only calculate total if BOTH unit_cost and quantity are present
+        if self.unit_cost is not None and self.quantity is not None:
             self.total_cost = self.unit_cost * self.quantity
+        else:
+            self.total_cost = None
         super().save(*args, **kwargs)
-
-    def to_dict(self):
-        return {
-            'code': self.code,
-            'department': self.department,
-            'purpose': self.purpose,
-            'status': self.status,
-            'priority': self.priority,
-            'requested_by': self.requested_by.email if self.requested_by else None,
-            'approved_by': self.approved_by.email if self.approved_by else None,
-            'total_items': self.items.count(),
-            'total_cost': sum(item.total_cost or 0 for item in self.items.all())
-        }
-
-
 
 
 class PurchaseOrder(models.Model):
@@ -173,7 +161,7 @@ class PurchaseOrder(models.Model):
     ]
     
     code = models.CharField(max_length=100, unique=True, blank=True, null=True)
-    order_number = models.CharField(max_length=100, blank=True, null=True, help_text="Manual order number (optional)")  # ← ADD THIS
+    order_number = models.CharField(max_length=100, blank=True, null=True, help_text="Manual order number (optional)")
     requisition = models.ForeignKey(Requisition, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_orders')
     vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='purchase_orders')
     department = models.CharField(max_length=100)
@@ -191,6 +179,7 @@ class PurchaseOrder(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     approved_at = models.DateTimeField(null=True, blank=True)
     discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='NGN')
     use_inclusive_pricing = models.BooleanField(default=False, null=True, blank=True)
     layout = models.CharField(
         max_length=50,
@@ -198,61 +187,38 @@ class PurchaseOrder(models.Model):
         help_text="Template layout for printing (e.g., 'classic', 'detailed')", null=True, blank=True
     )
 
-    def _recalculate_totals(self):
-        items = self.items.all()
-        subtotal = sum(item.get_subtotal() for item in items)
-        total_vat = sum(item.get_vat_amount() for item in items)
-        total_discount = sum(item.get_discount_amount() for item in items)
-        
-        # Apply global discount
-        global_discount = subtotal * (self.discount_percent / 100)
-        discounted_subtotal = subtotal - global_discount
-        
-        self.total_amount = discounted_subtotal + total_vat
-
     class Meta:
         ordering = ['-created_at']
 
     def save(self, *args, **kwargs):
         if not self.code:
             self.code = f"PO-{uuid.uuid4().hex[:8].upper()}"
-        # Calculate total amount from PO items
+        # Only calculate total_amount if ALL items have unit_price
         if self.pk:
-            self.total_amount = self.items.aggregate(
-                total=models.Sum(models.F('unit_price') * models.F('quantity'))
-            )['total'] or 0
+            total = 0
+            all_have_price = True
+            for item in self.items.all():
+                if item.unit_price is None:
+                    all_have_price = False
+                    break
+                total += item.unit_price * item.quantity
+            self.total_amount = total if all_have_price else None
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.code} - {self.vendor.name} ({self.status})"
 
     def can_approve(self, user):
-        """Check if user can approve this purchase order using ApprovalBoard"""
         try:
             approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
             return approval_member.can_approve_purchase_orders
         except ApprovalBoard.DoesNotExist:
             return False
 
-
     def is_fully_received(self):
-        """Check if all PO items have been received"""
         if not self.items.exists():
             return False
         return all(item.received_quantity >= item.quantity for item in self.items.all())
-
-    def to_dict(self):
-        return {
-            'code': self.code,
-            'vendor': self.vendor.name if self.vendor else None,
-            'department': self.department,
-            'status': self.status,
-            'total_amount': float(self.total_amount),
-            'expected_delivery_date': self.expected_delivery_date.isoformat() if self.expected_delivery_date else None,
-            'total_items': self.items.count()
-        }
-
-
 
 
 class POItem(models.Model):
@@ -260,12 +226,12 @@ class POItem(models.Model):
     item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='po_items')
     quantity = models.PositiveIntegerField()
     received_quantity = models.PositiveIntegerField(default=0)
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     total_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='po_items')
     created_at = models.DateTimeField(auto_now_add=True)
-    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)  # e.g., 7.5 for 7.5%
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
     discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
 
     class Meta:
@@ -274,33 +240,21 @@ class POItem(models.Model):
     def __str__(self):
         return f"{self.item.name} x {self.quantity} @ {self.unit_price}"
 
-
     def clean(self):
         if self.quantity <= 0:
             raise ValidationError("Quantity must be positive.")
-        if self.unit_price <= 0:
-            raise ValidationError("Unit price must be positive.")
+        # ✅ REMOVED: unit_price validation — it's optional
         if self.received_quantity > self.quantity:
             raise ValidationError("Received quantity cannot exceed ordered quantity.")
 
-    def get_subtotal(self):
-        return self.unit_price * self.quantity
-
-    def get_discount_amount(self):
-        return self.get_subtotal() * (self.discount_percent / 100)
-
-    def get_net_amount(self):
-        return self.get_subtotal() - self.get_discount_amount()
-
-    def get_vat_amount(self):
-        return self.get_net_amount() * (self.vat_rate / 100)
-
-    def get_total(self):
-        return self.get_net_amount() + self.get_vat_amount()
-
     def save(self, *args, **kwargs):
-        self.total_price = self.unit_price * self.quantity
+        # Only calculate total_price if BOTH unit_price and quantity are present
+        if self.unit_price is not None and self.quantity is not None:
+            self.total_price = self.unit_price * self.quantity
+        else:
+            self.total_price = None
         super().save(*args, **kwargs)
+
 
 class Receiving(models.Model):
     STATUS_CHOICES = [
@@ -334,28 +288,12 @@ class Receiving(models.Model):
         return f"Receiving {self.grn} for {self.po.code}"
 
     def update_po_status(self):
-        """Update PO status based on receiving status"""
         po = self.po
         if po.is_fully_received():
             po.status = 'received'
         elif any(r.status == 'complete' for r in po.receivings.all()):
             po.status = 'partially_received'
         po.save()
-
-
-
-
-    def to_dict(self):
-        return {
-            'grn': self.grn,
-            'po_code': self.po.code if self.po else None,
-            'invoice_number': self.invoice_number,
-            'status': self.status,
-            'total_items': self.items.count(),
-            'total_received': sum(item.received_quantity for item in self.items.all())
-        }
-
-
 
 
 class ReceivingItem(models.Model):
@@ -388,12 +326,8 @@ class ReceivingItem(models.Model):
     def save(self, *args, **kwargs):
         self.rejected_quantity = self.received_quantity - self.accepted_quantity
         super().save(*args, **kwargs)
-        
-        # Update PO item received quantity
         self.po_item.received_quantity += self.accepted_quantity
         self.po_item.save()
-        
-        # Update inventory stock if accepted
         if self.accepted_quantity > 0 and self.storage_bin:
             from inventory.models import StockRecord
             stock_record, created = StockRecord.objects.get_or_create(
@@ -404,8 +338,8 @@ class ReceivingItem(models.Model):
             stock_record.quantity += self.accepted_quantity
             stock_record.save()
 
+
 class GoodsReceipt(models.Model):
-    """Legacy model - consider deprecating in favor of Receiving model"""
     po_code = models.CharField(max_length=100)
     grn_code = models.CharField(max_length=100)
     invoice_code = models.CharField(max_length=100)
@@ -416,31 +350,6 @@ class GoodsReceipt(models.Model):
 
     def __str__(self):
         return f"GRN {self.grn_code} for PO {self.po_code}"
-
-# Audit trail for procurement activities
-class ProcurementAuditLog(models.Model):
-    ACTION_CHOICES = [
-        ('create', 'Create'),
-        ('update', 'Update'),
-        ('delete', 'Delete'),
-        ('approve', 'Approve'),
-        ('reject', 'Reject'),
-        ('receive', 'Receive'),
-    ]
-    
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
-    model_name = models.CharField(max_length=50)
-    object_id = models.PositiveIntegerField()
-    details = models.JSONField(default=dict)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"{self.user.email} {self.action} {self.model_name} {self.object_id}"
-
 
 
 class ProcurementAuditLog(models.Model):
@@ -464,3 +373,6 @@ class ProcurementAuditLog(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email} {self.action} {self.model_name} {self.object_id}"

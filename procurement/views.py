@@ -8,6 +8,7 @@ from django.conf import settings
 from datetime import datetime
 from io import BytesIO
 
+
 # ReportLab imports for PDF generation
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -19,7 +20,7 @@ from reportlab.lib.units import inch
 
 from .models import (
     Requisition, RequisitionItem, PurchaseOrder, POItem, 
-    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
+    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard, CURRENCY_CHOICES
 )
 from .serializers import (
     RequisitionSerializer, PurchaseOrderSerializer, 
@@ -523,17 +524,25 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         po.approved_at = datetime.now()
         po.save()
         
-        # TEMPORARILY COMMENTED OUT - Audit logging disabled
-        # log_procurement_action(
-        #     user=request.user,
-        #     action='approve',
-        #     model_name='PurchaseOrder',
-        #     object_id=po.id,
-        #     instance=po,
-        #     details={'status_change': f'{old_status} -> approved'}
-        # )
-        
         return Response({'status': 'approved'})
+
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Return summary statistics for all purchase orders"""
+        total = PurchaseOrder.objects.count()
+        pending = PurchaseOrder.objects.filter(status='submitted').count()
+        approved = PurchaseOrder.objects.filter(status='approved').count()
+        rejected = PurchaseOrder.objects.filter(status='rejected').count()
+
+        return Response({
+            'total': total,
+            'pending': pending,
+            'approved': approved,
+            'rejected': rejected,
+        })
+
+        
 
     @action(detail=True, methods=['get'])
     def export_pdf(self, request, pk=None):
@@ -567,6 +576,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             'SmallInfo', parent=styles['Normal'],
             fontSize=9, leading=12, textColor=colors.black
         )
+
+        wrapped_style = ParagraphStyle(
+            'Wrapped',
+            parent=styles['Normal'],
+            fontSize=9,
+            leading=12,
+            wordWrap='CJK',  # enables multi-line wrapping
+            textColor=colors.black,
+        )
+
 
         # === Header Section ===
         if hasattr(settings, 'COMPANY_LOGO_PATH'):
@@ -699,6 +718,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             ["Expected Delivery", po.expected_delivery_date.strftime('%d/%m/%Y') if po.expected_delivery_date else "—"],
             ["Payment Terms", po.payment_terms or "—"],
             ["Status", po.get_status_display() or "—"],
+            ["Currency", dict(CURRENCY_CHOICES).get(po.currency, po.currency)],
         ]
         po_table = Table(po_details, colWidths=[2.0*inch, 4.1*inch])
         po_table.setStyle(TableStyle([
@@ -719,36 +739,49 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         elements.append(Paragraph("<b>ITEMS</b>", section_heading))
         elements.append(Spacer(1, 6))
 
-        item_headers = ["Item", "Description", "Qty", "Unit Price (₦)", "Total (₦)"]
+        currency_symbol = '₦' if po.currency == 'NGN' else '$'
+        item_headers = ["Item", "Description", "Qty", f"Unit Price ({currency_symbol})", f"Total ({currency_symbol})"]
+
         item_data = [item_headers]
 
         total_amount = 0
         for item in po.items.all():
-            total = item.quantity * item.unit_price
+            unit_price = item.unit_price if item.unit_price is not None else 0
+            total = item.quantity * unit_price
             total_amount += total
+
             item_data.append([
                 item.item.name if item.item else "—",
                 getattr(item, 'notes', '') or "—",
                 str(item.quantity),
-                f"{item.unit_price:.2f}",
-                f"{total:.2f}"
+                f"{item.unit_price:.2f}" if item.unit_price is not None else "—",
+                f"{total:.2f}" if total > 0 else "—"
             ])
+
+           
 
         # Add total row
         item_data.append(["", "", "", "TOTAL:", f"{total_amount:.2f}"])
 
-        item_table = Table(item_data, colWidths=[1.2*inch, 2.0*inch, 0.8*inch, 1.0*inch, 1.1*inch])
+        item_table = Table(
+            item_data,
+            colWidths=[1.2*inch, 2.0*inch, 0.8*inch, 1.0*inch, 1.1*inch],
+            repeatRows=1
+        )
         item_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#E0E0E0")),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
             ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('GRID', (0, 0), (-1, -2), 0.35, colors.HexColor("#D0D0D0")),
             ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
             ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
             ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#F6F6F6")),
             ('TOPPADDING', (0, 0), (-1, -1), 6),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
         ]))
         elements.append(item_table)
         elements.append(Spacer(1, 12))

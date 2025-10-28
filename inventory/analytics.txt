@@ -1,0 +1,1082 @@
+models.py:
+from django.db import models
+from django.conf import settings
+from django.core.exceptions import ValidationError
+import math
+from django.utils import timezone
+
+class DwellTime(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    item = models.CharField(max_length=100)
+    duration_days = models.PositiveIntegerField()
+    is_aging = models.BooleanField(default=False)
+    storage_cost = models.DecimalField(max_digits=10, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Dwell Time"
+        verbose_name_plural = "Dwell Times"
+
+    def __str__(self):
+        return f"Dwell for {self.item}: {self.duration_days} days"
+
+class EOQReport(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    item = models.CharField(max_length=100)
+    part_number = models.CharField(max_length=50)
+    demand_rate = models.PositiveIntegerField(help_text="Units/year")
+    order_cost = models.DecimalField(max_digits=10, decimal_places=2)
+    holding_cost = models.DecimalField(max_digits=10, decimal_places=2)
+    eoq = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "EOQ Report"
+        verbose_name_plural = "EOQ Reports"
+
+    def __str__(self):
+        return f"EOQ for {self.item} ({self.created_at})"
+
+class EOQReportV2(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='eoq_reports_v2')
+    item = models.ForeignKey('inventory.Item', on_delete=models.CASCADE, related_name='eoq_reports_v2', help_text="Inventory item")
+    demand_rate = models.PositiveIntegerField(help_text="Annual demand in units")
+    ordering_cost = models.DecimalField(max_digits=10, decimal_places=2, help_text="Cost per order")  # Changed to ordering_cost
+    holding_cost = models.DecimalField(max_digits=10, decimal_places=2, help_text="Holding cost per unit per year")
+    lead_time_days = models.PositiveIntegerField(help_text="Lead time in days")
+    safety_stock = models.PositiveIntegerField(default=0, help_text="Safety stock in units")
+    eoq = models.PositiveIntegerField(blank=True, help_text="Calculated Economic Order Quantity")
+    reorder_point = models.PositiveIntegerField(blank=True, help_text="Inventory level to trigger reorder")
+    total_cost = models.DecimalField(max_digits=12, decimal_places=2, blank=True, help_text="Total inventory cost at EOQ")
+    holding_cost_breakdown = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True, help_text="Holding cost component")
+    ordering_cost_breakdown = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True, help_text="Ordering cost component")
+    inventory_turnover = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True, help_text="Inventory turnover ratio")
+    supplier = models.ForeignKey('Supplier', on_delete=models.SET_NULL, null=True, blank=True, help_text="Supplier for this item")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "EOQ Report V2"
+        verbose_name_plural = "EOQ Reports V2"
+
+    def calculate_safety_stock(self):
+        from inventory.models import StockMovement
+        try:
+            # Get last 6 months of stock movements for the item
+            movements = StockMovement.objects.filter(
+                item=self.item,
+                timestamp__gte=self.created_at - timezone.timedelta(days=180)
+            ).values('quantity')
+            quantities = [m['quantity'] for m in movements]
+            if not quantities:
+                return 0
+            max_daily_demand = max(quantities) / 30  # Assume monthly avg
+            avg_daily_demand = sum(quantities) / len(quantities) / 30
+            max_lead_time = self.lead_time_days * 1.2  # 20% buffer
+            return round((max_daily_demand * max_lead_time) - (avg_daily_demand * self.lead_time_days))
+        except:
+            return 0
+
+    def clean(self):
+        if self.demand_rate <= 0:
+            raise ValidationError("Demand rate must be positive.")
+        if self.ordering_cost <= 0:  # Changed to ordering_cost
+            raise ValidationError("Ordering cost must be positive.")
+        if self.holding_cost <= 0:
+            raise ValidationError("Holding cost must be positive.")
+        if self.lead_time_days < 0:
+            raise ValidationError("Lead time cannot be negative.")
+
+        # Calculate EOQ: sqrt(2 * D * S / H)
+        try:
+            eoq = math.sqrt((2 * self.demand_rate * float(self.ordering_cost)) / float(self.holding_cost))
+            self.eoq = round(eoq)
+        except (ValueError, ZeroDivisionError):
+            raise ValidationError("Invalid values for EOQ calculation.")
+
+        # Calculate Reorder Point: (Demand Rate per day * Lead Time) + Safety Stock
+        demand_per_day = self.demand_rate / 365
+        self.reorder_point = round(demand_per_day * self.lead_time_days) + self.safety_stock
+
+        # Calculate Total Cost: sqrt(2 * D * S * H)
+        self.total_cost = round(math.sqrt(2 * self.demand_rate * float(self.ordering_cost) * float(self.holding_cost)), 2)
+
+        # Calculate Cost Breakdowns
+        orders_per_year = self.demand_rate / self.eoq if self.eoq else 0
+        self.holding_cost_breakdown = round((self.eoq / 2) * float(self.holding_cost), 2)
+        self.ordering_cost_breakdown = round(orders_per_year * float(self.ordering_cost), 2)
+
+        # Calculate Inventory Turnover
+        self.inventory_turnover = round(self.demand_rate / (self.eoq / 2), 2) if self.eoq else 0
+
+    def save(self, *args, **kwargs):
+        self.safety_stock = self.calculate_safety_stock()
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"EOQ Report for {self.item.name} ({self.created_at})"
+
+class StockAnalytics(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='stock_analytics')
+    item = models.CharField(max_length=255)
+    category = models.CharField(max_length=20, choices=[('A', 'A'), ('B', 'B'), ('C', 'C')])
+    turnover_rate = models.DecimalField(max_digits=10, decimal_places=2)
+    obsolescence_risk = models.CharField(max_length=20)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Stock Analytics"
+        verbose_name_plural = "Stock Analytics"
+
+    def __str__(self):
+        return f"{self.item} - {self.category}"
+
+class ReorderQueue(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='reorder_queues')
+    item = models.ForeignKey('inventory.Item', on_delete=models.CASCADE, related_name='reorder_queues')
+    recommended_quantity = models.PositiveIntegerField(help_text="Quantity to reorder based on EOQ")
+    status = models.CharField(max_length=20, choices=[
+        ('Pending', 'Pending'),
+        ('Ordered', 'Ordered'),
+        ('Completed', 'Completed')
+    ], default='Pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Reorder Queue"
+        verbose_name_plural = "Reorder Queues"
+
+    def __str__(self):
+        return f"Reorder {self.recommended_quantity} of {self.item.name}"
+
+class Supplier(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    lead_time_days = models.PositiveIntegerField(default=7, help_text="Default lead time in days")
+    min_order_quantity = models.PositiveIntegerField(blank=True, null=True, help_text="Minimum order quantity")
+    discount_threshold = models.PositiveIntegerField(blank=True, null=True, help_text="Quantity for discount")
+    discount_percentage = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True, help_text="Discount percentage")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Supplier"
+        verbose_name_plural = "Suppliers"
+
+    def __str__(self):
+        return self.name
+
+
+
+
+
+
+
+
+
+
+views.py:
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.generics import ListAPIView
+from rest_framework import status, viewsets
+from accounts.views import check_permission
+from accounts.permissions import DynamicPermission
+from .models import DwellTime, EOQReport, EOQReportV2, StockAnalytics, ReorderQueue, Supplier
+from .serializers import DwellTimeSerializer, EOQReportSerializer, EOQReportV2Serializer, StockAnalyticsSerializer, ReorderQueueSerializer, SupplierSerializer
+from inventory.models import StockMovement, Item
+from django.utils import timezone
+from django.db.models import Sum
+import math
+
+class DashboardMetricsView(APIView):
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_dashboard'
+
+    def get(self, request):
+        user = request.user
+        total_stock_items = Item.objects.filter(user=user).count()  # Changed to user
+        low_stock_items = Item.objects.filter(user=user, total_quantity__lte=Item._meta.get_field('min_stock_level').default).count()  # Changed to user
+        dwell_items = DwellTime.objects.filter(user=user).count()
+        eoq_reports = EOQReportV2.objects.filter(user=user).count()
+        reorder_queue = ReorderQueue.objects.filter(user=user, status='Pending').count()
+        receipt_count = 0  # Placeholder for Receipt model
+
+        metrics = [
+            {"id": 1, "title": "Total Stock Items", "value": total_stock_items, "trend": "up", "change": "+12%"},
+            {"id": 2, "title": "Low Stock Items", "value": low_stock_items, "trend": "down", "change": "-4%"},
+            {"id": 3, "title": "Reorder Queue", "value": reorder_queue, "trend": "up", "change": "+8%"},
+            {"id": 4, "title": "Dwell Records", "value": dwell_items, "trend": "neutral", "change": "0%"},
+            {"id": 5, "title": "EOQ Reports", "value": eoq_reports, "trend": "up", "change": "+5%"},
+            {"id": 6, "title": "Receipts Logged", "value": receipt_count, "trend": "up", "change": "+3%"},
+        ]
+        return Response({"metrics": metrics, "activities": []})
+
+class UserDwellTimeListView(ListAPIView):
+    serializer_class = DwellTimeSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_dwell'
+
+    def get_queryset(self):
+        return DwellTime.objects.filter(user=self.request.user)
+
+    def post(self, request):
+        check_permission(self.request.user, action='create_dwell')
+        serializer = DwellTimeSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserEOQReportListView(ListAPIView):
+    serializer_class = EOQReportSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_eoq'
+
+    def get_queryset(self):
+        return EOQReport.objects.filter(user=self.request.user)
+
+    def post(self, request):
+        check_permission(self.request.user, action='create_eoq')
+        serializer = EOQReportSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class EOQReportV2ViewSet(viewsets.ModelViewSet):
+    queryset = EOQReportV2.objects.all()
+    serializer_class = EOQReportV2Serializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_eoq'
+
+    def get_action_permission_name(self, action):
+        return {
+            'create': 'create_eoq',
+            'update': 'update_eoq',
+            'destroy': 'delete_eoq',
+        }.get(action, None)
+
+    def get_queryset(self):
+        return EOQReportV2.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        check_permission(self.request.user, page=self.page_permission_name, action='create_eoq')
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        check_permission(self.request.user, page=self.page_permission_name, action='update_eoq')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        check_permission(self.request.user, page=self.page_permission_name, action='delete_eoq')
+        instance.delete()
+
+class UserStockAnalyticsListView(APIView):
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_stock'
+
+    def get(self, request):
+        data = StockAnalytics.objects.filter(user=request.user)
+        serializer = StockAnalyticsSerializer(data, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        check_permission(self.request.user, action='create_stock_analytics')
+        serializer = StockAnalyticsSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ReorderQueueViewSet(viewsets.ModelViewSet):
+    queryset = ReorderQueue.objects.all()
+    serializer_class = ReorderQueueSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_reorder'
+
+    def get_action_permission_name(self, action):
+        return {
+            'create': 'create_reorder',
+            'update': 'update_reorder',
+            'destroy': 'delete_reorder',
+        }.get(action, None)
+
+    def get_queryset(self):
+        return ReorderQueue.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        check_permission(self.request.user, page=self.page_permission_name, action='create_reorder')
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        check_permission(self.request.user, page=self.page_permission_name, action='update_reorder')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        check_permission(self.request.user, page=self.page_permission_name, action='delete_reorder')
+        instance.delete()
+
+class SupplierViewSet(viewsets.ModelViewSet):
+    queryset = Supplier.objects.all()
+    serializer_class = SupplierSerializer
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_supplier'
+
+    def get_action_permission_name(self, action):
+        return {
+            'create': 'create_supplier',
+            'update': 'update_supplier',
+            'destroy': 'delete_supplier',
+        }.get(action, None)
+
+    def get_queryset(self):
+        return Supplier.objects.all()  # Shared across users for simplicity
+
+    def perform_create(self, serializer):
+        check_permission(self.request.user, page=self.page_permission_name, action='create_supplier')
+        serializer.save()
+
+    def perform_update(self, serializer):
+        check_permission(self.request.user, page=self.page_permission_name, action='update_supplier')
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        check_permission(self.request.user, page=self.page_permission_name, action='delete_supplier')
+        instance.delete()
+
+class DemandForecastView(APIView):
+    permission_classes = [IsAuthenticated, DynamicPermission]
+    page_permission_name = 'analytics_forecast'
+
+    def get(self, request):
+        item_id = request.query_params.get('item_id')
+        if not item_id:
+            return Response({"error": "Item ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            item = Item.objects.get(id=item_id, user=request.user)  # Fixed: Changed created_by to user
+        except Item.DoesNotExist:
+            return Response({"error": "Item not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Calculate demand from last 6 months of StockMovement
+        six_months_ago = timezone.now() - timezone.timedelta(days=180)
+        movements = StockMovement.objects.filter(
+            item=item,
+            timestamp__gte=six_months_ago,
+            movement_type='OUT'
+        ).aggregate(total_demand=Sum('quantity'))
+
+        total_demand = movements['total_demand'] or 0
+        annualized_demand = round(total_demand * (365 / 180))  # Scale to yearly
+        return Response({
+            "item_id": item.id,
+            "item_name": item.name,
+            "forecasted_demand": annualized_demand,
+            "period_days": 180
+        })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+serializer.py:
+from rest_framework import serializers
+from .models import DwellTime, EOQReport, EOQReportV2, StockAnalytics, ReorderQueue, Supplier
+from inventory.models import Item
+
+class ItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Item
+        fields = ['id', 'name', 'material_id', 'part_number', 'description']
+
+class DwellTimeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DwellTime
+        fields = '__all__'
+        read_only_fields = ['user', 'created_at']
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+class EOQReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EOQReport
+        fields = '__all__'
+        read_only_fields = ['user', 'created_at']
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+class EOQReportV2Serializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    part_number = serializers.CharField(source='item.part_number', read_only=True)
+    user_email = serializers.EmailField(source='user.email', read_only=True)
+    supplier_name = serializers.CharField(source='supplier.name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = EOQReportV2
+        fields = [
+            'id', 'user', 'user_email', 'item', 'item_name', 'part_number',
+            'demand_rate', 'ordering_cost', 'holding_cost', 'lead_time_days',  # Changed order_cost to ordering_cost
+            'safety_stock', 'eoq', 'reorder_point', 'total_cost',
+            'holding_cost_breakdown', 'ordering_cost_breakdown', 'inventory_turnover',
+            'supplier', 'supplier_name', 'created_at', 'updated_at'
+        ]
+        read_only_fields = [
+            'user', 'user_email', 'item_name', 'part_number', 'eoq', 'reorder_point',
+            'total_cost', 'holding_cost_breakdown', 'ordering_cost_breakdown',
+            'inventory_turnover', 'created_at', 'updated_at', 'supplier_name'
+        ]
+
+    def validate(self, data):
+        if data.get('demand_rate', 0) <= 0:
+            raise serializers.ValidationError("Demand rate must be positive.")
+        if data.get('ordering_cost', 0) <= 0:  # Changed to ordering_cost
+            raise serializers.ValidationError("Ordering cost must be positive.")
+        if data.get('holding_cost', 0) <= 0:
+            raise serializers.ValidationError("Holding cost must be positive.")
+        if data.get('lead_time_days', 0) < 0:
+            raise serializers.ValidationError("Lead time cannot be negative.")
+        return data
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+class StockAnalyticsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockAnalytics
+        fields = ['id', 'item', 'category', 'turnover_rate', 'obsolescence_risk']
+        read_only_fields = ['user', 'created_at']
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+class ReorderQueueSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    user_email = serializers.EmailField(source='user.email', read_only=True)
+
+    class Meta:
+        model = ReorderQueue
+        fields = ['id', 'user', 'user_email', 'item', 'item_name', 'recommended_quantity', 'status', 'created_at', 'updated_at']
+        read_only_fields = ['user', 'user_email', 'item_name', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        validated_data['user'] = self.context['request'].user
+        return super().create(validated_data)
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Supplier
+        fields = ['id', 'name', 'lead_time_days', 'min_order_quantity', 'discount_threshold', 'discount_percentage', 'created_at']
+        read_only_fields = ['created_at']
+
+
+
+
+
+
+
+
+
+
+
+
+   urls.py:
+   from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import (
+    DashboardMetricsView, UserDwellTimeListView, UserEOQReportListView,
+    UserStockAnalyticsListView, EOQReportV2ViewSet, ReorderQueueViewSet,
+    SupplierViewSet, DemandForecastView
+)
+
+router = DefaultRouter()
+router.register(r'eoq-v2', EOQReportV2ViewSet, basename='eoq-v2')
+router.register(r'reorder-queue', ReorderQueueViewSet, basename='reorder-queue')
+router.register(r'suppliers', SupplierViewSet, basename='suppliers')
+
+urlpatterns = [
+    path('dashboard/', DashboardMetricsView.as_view(), name='dashboard-metrics'),
+    path('dwell/', UserDwellTimeListView.as_view(), name='dwell-time-list'),
+    path('eoq/', UserEOQReportListView.as_view(), name='eoq-report-list'),
+    path('stock/', UserStockAnalyticsListView.as_view(), name='stock-analytics'),
+    path('forecast/', DemandForecastView.as_view(), name='demand-forecast'),
+    path('', include(router.urls)),
+]
+
+
+
+
+
+
+
+
+
+
+
+
+
+stocks.jsx:
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Container, Typography, Paper, Table, TableHead, TableRow, TableCell,
+  TableBody, TextField, Box, TableContainer, InputAdornment, Pagination,
+  CircularProgress, Alert, Button, Dialog, DialogTitle, DialogContent,
+  DialogActions, Grid, FormControl, InputLabel, Select, MenuItem, Link
+} from '@mui/material';
+import SearchIcon from '@mui/icons-material/Search';
+import AssessmentIcon from '@mui/icons-material/Assessment';
+import { toast } from 'react-hot-toast';
+import { useNavigate } from 'react-router-dom';
+import API from '../../api';
+import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
+import { Pie, Bar } from 'react-chartjs-2';
+
+ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title);
+
+export default function StockAnalytics() {
+  const [data, setData] = useState([]);
+  const [forecastData, setForecastData] = useState([]);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({
+    item: '',
+    category: 'A',
+    turnover_rate: '',
+    obsolescence_risk: '',
+  });
+  const [formAlert, setFormAlert] = useState(null);
+  const [formLoading, setFormLoading] = useState(false);
+  const [hasPageAccess, setHasPageAccess] = useState(false);
+  const [checkingPermissions, setCheckingPermissions] = useState(true);
+  const [canCreateStock, setCanCreateStock] = useState(false);
+  const itemsPerPage = 10;
+  const navigate = useNavigate();
+
+  const checkAuth = useCallback(() => {
+    const token = localStorage.getItem('accessToken');
+    if (!token) {
+      setError('⚠️ No authentication token found. Please log in.');
+      setTimeout(() => navigate('/login'), 2000);
+      return false;
+    }
+    return token;
+  }, [navigate]);
+
+  const fetchStockData = useCallback(async () => {
+    const token = checkAuth();
+    if (!token) return;
+    
+    try {
+      const response = await API.get('analytics/stock/', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setData(response.data.results || response.data);
+      setLoading(false);
+    } catch (err) {
+      console.error('Error fetching stock analytics:', err);
+      if (err.response?.status === 401) {
+        setError('⚠️ Session expired. Please log in again.');
+        navigate('/login');
+      } else {
+        setError(`⚠️ Failed to load stock analytics: ${err.response?.data?.detail || err.message}`);
+      }
+      setLoading(false);
+    }
+  }, [checkAuth, navigate]);
+
+  const fetchForecastData = useCallback(async () => {
+    const token = checkAuth();
+    if (!token) return;
+    
+    try {
+      const response = await API.get('inventory/items/', {
+        headers: { Authorization: `Bearer ${token}` },
+        params: { page_size: 1000 }
+      });
+      const items = response.data.results || response.data;
+      const forecastPromises = items.map(item =>
+        API.get(`analytics/forecast/?item_id=${item.id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      );
+      const forecasts = await Promise.all(forecastPromises);
+      setForecastData(forecasts.map(res => res.data));
+    } catch (err) {
+      setError(`❌ Failed to fetch forecast data: ${err.response?.data?.detail || err.message}`);
+    }
+  }, [checkAuth]);
+
+  const checkPermissions = useCallback(async () => {
+    setCheckingPermissions(true);
+    const token = checkAuth();
+    if (!token) {
+      setHasPageAccess(false);
+      setCheckingPermissions(false);
+      return;
+    }
+
+    try {
+      const [pageResponse, actionResponse] = await Promise.all([
+        API.get('/auth/permissions/page/analytics_stock/', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        API.get('/auth/permissions/action/create_stock_analytics/', {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ]);
+      
+      if (!pageResponse.data.allowed) {
+        setError(`⚠️ ${pageResponse.data.reason || 'No permission to view stock analytics.'}`);
+        setHasPageAccess(false);
+        setCheckingPermissions(false);
+        return;
+      }
+      
+      setHasPageAccess(true);
+      setCanCreateStock(actionResponse.data.allowed || false);
+      await Promise.all([fetchStockData(), fetchForecastData()]);
+      
+    } catch (err) {
+      console.error('Error checking permissions:', err);
+      if (err.response?.status === 401) {
+        setError('⚠️ Authentication failed. Please log in again.');
+        navigate('/login');
+      } else {
+        setError(`⚠️ Failed to check permissions: ${err.response?.data?.detail || err.message}`);
+      }
+      setHasPageAccess(false);
+    } finally {
+      setCheckingPermissions(false);
+    }
+  }, [checkAuth, fetchStockData, fetchForecastData, navigate]);
+
+  useEffect(() => {
+    checkPermissions();
+  }, [checkPermissions]);
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setForm({ ...form, [name]: value });
+  };
+
+  const handleCreateStock = async () => {
+    const { item, category, turnover_rate, obsolescence_risk } = form;
+    if (!item || !category || !turnover_rate || !obsolescence_risk) {
+      setFormAlert('⚠ Please fill in all required fields.');
+      return;
+    }
+
+    const riskMapping = {
+      'Low Risk': 'low',
+      'Medium Risk': 'medium',
+      'High Risk': 'high',
+      'Critical Risk': 'critical',
+    };
+    const formattedForm = {
+      ...form,
+      obsolescence_risk: riskMapping[obsolescence_risk] || obsolescence_risk,
+    };
+
+    try {
+      setFormLoading(true);
+      const token = checkAuth();
+      if (!token) throw new Error('No authentication token found.');
+      
+      const res = await API.post('analytics/stock/', formattedForm, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      
+      setData(prevData => [res.data, ...prevData]);
+      setOpen(false);
+      setFormAlert(null);
+      setForm({ item: '', category: 'A', turnover_rate: '', obsolescence_risk: '' });
+      toast.success('✅ Stock analytics created successfully', { id: 'stock-create' });
+    } catch (err) {
+      console.error('Error creating stock analytics:', err.response?.data);
+      setFormAlert(err.response?.data?.detail || '❌ Failed to create stock analytics.');
+    } finally {
+      setFormLoading(false);
+    }
+  };
+
+  const filteredData = data.filter(
+    (item) =>
+      item.item?.toLowerCase().includes(search.toLowerCase()) ||
+      item.category?.toLowerCase().includes(search.toLowerCase()) ||
+      item.obsolescence_risk?.toLowerCase().includes(search.toLowerCase())
+  );
+
+  const paginatedData = filteredData.slice(
+    (page - 1) * itemsPerPage,
+    page * itemsPerPage
+  );
+
+  const categoryDistribution = {
+    labels: ['A Items (High Value)', 'B Items (Medium Value)', 'C Items (Low Value)'],
+    datasets: [{
+      label: 'Number of Items',
+      data: [
+        data.filter(item => item.category === 'A').length,
+        data.filter(item => item.category === 'B').length,
+        data.filter(item => item.category === 'C').length
+      ],
+      backgroundColor: ['#FF6384', '#36A2EB', '#FFCE56'],
+      borderWidth: 1,
+    }]
+  };
+
+  const riskDistribution = {
+    labels: ['Low Risk', 'Medium Risk', 'High Risk', 'Critical Risk'],
+    datasets: [{
+      label: 'Number of Items',
+      data: [
+        data.filter(item => item.obsolescence_risk?.toLowerCase().includes('low')).length,
+        data.filter(item => item.obsolescence_risk?.toLowerCase().includes('medium')).length,
+        data.filter(item => item.obsolescence_risk?.toLowerCase().includes('high')).length,
+        data.filter(item => item.obsolescence_risk?.toLowerCase().includes('critical')).length
+      ],
+      backgroundColor: ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384'],
+      borderWidth: 1,
+    }]
+  };
+
+  const turnoverAnalysis = {
+    labels: data.map(item => item.item).slice(0, 10),
+    datasets: [{
+      label: 'Turnover Rate',
+      data: data.map(item => parseFloat(item.turnover_rate) || 0).slice(0, 10),
+      backgroundColor: '#9966FF',
+      borderWidth: 1,
+    }, {
+      label: 'Forecasted Demand (units/year)',
+      data: data.map(item => {
+        const forecast = forecastData.find(f => f.item_name === item.item)?.forecasted_demand || 0;
+        return forecast;
+      }).slice(0, 10),
+      backgroundColor: '#82ca9d',
+      borderWidth: 1,
+    }]
+  };
+
+  if (checkingPermissions) {
+    return (
+      <Container maxWidth="md" sx={{ py: 4 }}>
+        <Typography variant="h6">Loading permissions...</Typography>
+      </Container>
+    );
+  }
+
+  if (!hasPageAccess) {
+    return (
+      <Container maxWidth="md" sx={{ py: 4 }}>
+        <Alert severity="error">{error || 'Access Denied: You do not have permission to view this page.'}</Alert>
+      </Container>
+    );
+  }
+
+  return (
+    <Container maxWidth="lg" sx={{ mt: 4 }}>
+      <Paper elevation={3} sx={{ p: 4 }}>
+        <Typography variant="h4" gutterBottom>
+          Stock Analytics
+        </Typography>
+        <Typography variant="subtitle1" sx={{ mb: 3 }}>
+          Review turnover rates, ABC classifications, and obsolescence risk. For EOQ and reorder recommendations, visit{' '}
+          <Link href="/analytics/optimization" color="primary">Stock Optimization</Link>.
+        </Typography>
+
+        <Box display="flex" justifyContent="space-between" mb={2}>
+          <TextField
+            placeholder="Search by item, category, or risk..."
+            variant="outlined"
+            size="small"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon />
+                </InputAdornment>
+              ),
+            }}
+          />
+          <Button
+            variant="contained"
+            onClick={() => setOpen(true)}
+            disabled={!canCreateStock}
+          >
+            Add Stock Analytics
+          </Button>
+        </Box>
+
+        {loading ? (
+          <Box display="flex" justifyContent="center" my={4}>
+            <CircularProgress />
+          </Box>
+        ) : error ? (
+          <Alert severity="error">{error}</Alert>
+        ) : (
+          <>
+            <Box sx={{ mb: 4, display: 'flex', flexWrap: 'wrap', gap: 3, justifyContent: 'center' }}>
+              <Box sx={{ width: 300, p: 2, border: '1px solid #e0e0e0', borderRadius: 2 }}>
+                <Typography variant="h6" gutterBottom align="center">
+                  ABC Classification
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2, textAlign: 'center' }}>
+                  A: High value items (20% of items, 80% of value)<br/>
+                  B: Medium value items (30% of items, 15% of value)<br/>
+                  C: Low value items (50% of items, 5% of value)
+                </Typography>
+                {data.length > 0 ? (
+                  <Pie data={categoryDistribution} />
+                ) : (
+                  <Typography variant="body2" color="text.secondary" align="center">
+                    No data for chart
+                  </Typography>
+                )}
+              </Box>
+
+              <Box sx={{ width: 300, p: 2, border: '1px solid #e0e0e0', borderRadius: 2 }}>
+                <Typography variant="h6" gutterBottom align="center">
+                  Obsolescence Risk
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2, textAlign: 'center' }}>
+                  Monitor items at risk of becoming obsolete
+                </Typography>
+                {data.length > 0 ? (
+                  <Pie data={riskDistribution} />
+                ) : (
+                  <Typography variant="body2" color="text.secondary" align="center">
+                    No data for chart
+                  </Typography>
+                )}
+              </Box>
+
+              <Box sx={{ width: 400, p: 2, border: '1px solid #e0e0e0', borderRadius: 2 }}>
+                <Typography variant="h6" gutterBottom align="center">
+                  Top 10 Items by Turnover & Demand
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2, textAlign: 'center' }}>
+                  Higher turnover = faster selling items. Forecasted demand aids EOQ planning.
+                </Typography>
+                {data.length > 0 ? (
+                  <Bar 
+                    data={turnoverAnalysis} 
+                    options={{
+                      responsive: true,
+                      plugins: {
+                        legend: { display: true }
+                      }
+                    }}
+                  />
+                ) : (
+                  <Typography variant="body2" color="text.secondary" align="center">
+                    No data for chart
+                  </Typography>
+                )}
+              </Box>
+            </Box>
+
+            <TableContainer>
+              <Table>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>S/N</TableCell>
+                    <TableCell>Item</TableCell>
+                    <TableCell>Category (ABC)</TableCell>
+                    <TableCell>Turnover Rate</TableCell>
+                    <TableCell>Obsolescence Risk</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {paginatedData.length > 0 ? (
+                    paginatedData.map((row, index) => (
+                      <TableRow key={row.id || index}>
+                        <TableCell>{(page - 1) * itemsPerPage + index + 1}</TableCell>
+                        <TableCell>
+                          <Box display="flex" alignItems="center" gap={1}>
+                            <AssessmentIcon fontSize="small" color="primary" />
+                            {row.item || 'N/A'}
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Box 
+                            sx={{ 
+                              px: 1, 
+                              py: 0.5, 
+                              borderRadius: 1, 
+                              display: 'inline-block',
+                              backgroundColor: 
+                                row.category === 'A' ? '#ffebee' : 
+                                row.category === 'B' ? '#e3f2fd' : '#fff8e1',
+                              color: 
+                                row.category === 'A' ? '#c62828' : 
+                                row.category === 'B' ? '#1565c0' : '#f57c00',
+                              fontWeight: 'bold'
+                            }}
+                          >
+                            {row.category || 'N/A'}
+                          </Box>
+                        </TableCell>
+                        <TableCell>{row.turnover_rate || 'N/A'}</TableCell>
+                        <TableCell>
+                          <Box 
+                            sx={{ 
+                              px: 1, 
+                              py: 0.5, 
+                              borderRadius: 1, 
+                              display: 'inline-block',
+                              backgroundColor: 
+                                row.obsolescence_risk?.toLowerCase().includes('low') ? '#e8f5e8' : 
+                                row.obsolescence_risk?.toLowerCase().includes('medium') ? '#fff3e0' :
+                                row.obsolescence_risk?.toLowerCase().includes('high') ? '#ffebee' : '#f5f5f5',
+                              color: 
+                                row.obsolescence_risk?.toLowerCase().includes('low') ? '#2e7d32' : 
+                                row.obsolescence_risk?.toLowerCase().includes('medium') ? '#f57c00' :
+                                row.obsolescence_risk?.toLowerCase().includes('high') ? '#c62828' : '#757575',
+                            }}
+                          >
+                            {row.obsolescence_risk || 'N/A'}
+                          </Box>
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  ) : (
+                    <TableRow>
+                      <TableCell colSpan={5} align="center">
+                        No matching records found.
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            <Box display="flex" justifyContent="center" mt={3}>
+              <Pagination
+                count={Math.ceil(filteredData.length / itemsPerPage)}
+                page={page}
+                onChange={(_, value) => setPage(value)}
+                color="primary"
+              />
+            </Box>
+          </>
+        )}
+
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 4 }}>
+          * ABC Classification: A items (high value), B items (medium value), C items (low value)<br/>
+          * Turnover Rate: How quickly items sell (higher = better)<br/>
+          * Obsolescence Risk: Likelihood items become outdated or unsellable
+        </Typography>
+
+        <Dialog open={open} onClose={() => setOpen(false)} fullWidth maxWidth="sm">
+          <DialogTitle>Add Stock Analytics</DialogTitle>
+          <DialogContent>
+            <Grid container spacing={2} sx={{ mt: 1 }}>
+              <Grid item xs={12}>
+                <TextField
+                  name="item"
+                  label="Item Name"
+                  fullWidth
+                  value={form.item}
+                  onChange={handleChange}
+                  required
+                />
+              </Grid>
+              <Grid item xs={12}>
+                <FormControl fullWidth required>
+                  <InputLabel>ABC Category</InputLabel>
+                  <Select
+                    name="category"
+                    value={form.category}
+                    onChange={handleChange}
+                    label="ABC Category"
+                  >
+                    <MenuItem value="A">A - High Value Items</MenuItem>
+                    <MenuItem value="B">B - Medium Value Items</MenuItem>
+                    <MenuItem value="C">C - Low Value Items</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+              <Grid item xs={12}>
+                <TextField
+                  name="turnover_rate"
+                  label="Turnover Rate"
+                  type="number"
+                  fullWidth
+                  value={form.turnover_rate}
+                  onChange={handleChange}
+                  inputProps={{ step: "0.01", min: 0 }}
+                  required
+                  helperText="How quickly items sell (higher = better)"
+                />
+              </Grid>
+              <Grid item xs={12}>
+                <FormControl fullWidth required>
+                  <InputLabel>Obsolescence Risk</InputLabel>
+                  <Select
+                    name="obsolescence_risk"
+                    value={form.obsolescence_risk}
+                    onChange={handleChange}
+                    label="Obsolescence Risk"
+                  >
+                    <MenuItem value="Low Risk">Low Risk</MenuItem>
+                    <MenuItem value="Medium Risk">Medium Risk</MenuItem>
+                    <MenuItem value="High Risk">High Risk</MenuItem>
+                    <MenuItem value="Critical Risk">Critical Risk</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+            </Grid>
+
+            {formAlert && (
+              <Alert sx={{ mt: 2 }} severity={formAlert.includes('❌') ? 'error' : 'warning'}>
+                {formAlert}
+              </Alert>
+            )}
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setOpen(false)}>Cancel</Button>
+            <Button
+              variant="contained"
+              onClick={handleCreateStock}
+              disabled={formLoading || !canCreateStock}
+            >
+              {formLoading ? <CircularProgress size={24} color="inherit" /> : 'Create'}
+            </Button>
+          </DialogActions>
+        </Dialog>
+      </Paper>
+    </Container>
+  );
+}
+
+
+
+
+

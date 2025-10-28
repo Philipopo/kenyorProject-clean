@@ -7,7 +7,9 @@ from .models import (
     Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
 )
 from inventory.serializers import ItemSerializer
+
 User = get_user_model()
+
 
 class ApprovalBoardSerializer(serializers.ModelSerializer):
     user_email = serializers.CharField(source='user.email', read_only=True)
@@ -18,6 +20,7 @@ class ApprovalBoardSerializer(serializers.ModelSerializer):
         model = ApprovalBoard
         fields = '__all__'
         read_only_fields = ['added_by', 'added_at']
+
 
 class VendorSerializer(serializers.ModelSerializer):
     class Meta:
@@ -30,6 +33,7 @@ class VendorSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'lead_time': 'Lead time must be positive.'})
         return data
 
+
 class RequisitionItemSerializer(serializers.ModelSerializer):
     item_details = ItemSerializer(source='item', read_only=True)
     
@@ -41,7 +45,9 @@ class RequisitionItemSerializer(serializers.ModelSerializer):
     def validate(self, data):
         if data.get('quantity', 0) <= 0:
             raise serializers.ValidationError({'quantity': 'Quantity must be positive.'})
-        if data.get('unit_cost', 0) <= 0:
+        # ✅ unit_cost is optional — only validate if provided
+        unit_cost = data.get('unit_cost')
+        if unit_cost is not None and unit_cost <= 0:
             raise serializers.ValidationError({'unit_cost': 'Unit cost must be positive.'})
         return data
 
@@ -57,23 +63,25 @@ class RequisitionSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = [
             'code', 'approved_by', 'created_at', 'updated_at', 'approved_at',
-            'requested_by', 'created_by'
+            'requested_by', 'created_by',
+            'currency'  # ← immutable after creation
         ]
 
+    def update(self, instance, validated_data):
+        # Prevent currency change after creation
+        if 'currency' in validated_data and instance.pk:
+            validated_data.pop('currency')
+        return super().update(instance, validated_data)
 
     def create(self, validated_data):
-        # Automatically set requested_by and created_by from request user
         user = self.context['request'].user
         validated_data['requested_by'] = user
         validated_data['created_by'] = user
         items_data = validated_data.pop('items', [])
         requisition = Requisition.objects.create(**validated_data)
-        
         for item_data in items_data:
             RequisitionItem.objects.create(requisition=requisition, **item_data)
-        
         return requisition
-
 
 
 class POItemSerializer(serializers.ModelSerializer):
@@ -87,9 +95,12 @@ class POItemSerializer(serializers.ModelSerializer):
     def validate(self, data):
         if data.get('quantity', 0) <= 0:
             raise serializers.ValidationError({'quantity': 'Quantity must be positive.'})
-        if data.get('unit_price', 0) <= 0:
+        # ✅ unit_price is optional — only validate if provided
+        unit_price = data.get('unit_price')
+        if unit_price is not None and unit_price <= 0:
             raise serializers.ValidationError({'unit_price': 'Unit price must be positive.'})
         return data
+
 
 class PurchaseOrderSerializer(serializers.ModelSerializer):
     items = POItemSerializer(many=True, required=False)
@@ -104,22 +115,19 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             'code', 'total_amount', 'approved_by', 'created_at',
             'updated_at', 'approved_at', 'created_by'
         ]
-        # Do NOT include 'layout' in read_only_fields
 
     def validate(self, data):
         if not data.get('vendor'):
             raise serializers.ValidationError({'vendor': 'Vendor is required.'})
-        
         if self.context['request'].method == 'POST' and data.get('status', 'draft') != 'draft':
             if not self.initial_data.get('items') or len(self.initial_data.get('items', [])) == 0:
                 raise serializers.ValidationError({'items': 'At least one item is required.'})
-        
         return data
 
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
-        validated_data['created_by'] = self.context['request'].user  # Set created_by
+        validated_data['created_by'] = self.context['request'].user
         po = PurchaseOrder.objects.create(**validated_data)
         
         total_amount = 0
@@ -128,7 +136,9 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                 if 'item' not in item_data:
                     raise serializers.ValidationError({'item': 'This field is required.'})
                 po_item = POItem.objects.create(po=po, **item_data)
-                total_amount += po_item.total_price
+                # ✅ Only add to total if total_price is not None
+                if po_item.total_price is not None:
+                    total_amount += po_item.total_price
             except Exception as e:
                 raise serializers.ValidationError({
                     'items': f'Error in item {index + 1}: {str(e)}'
@@ -151,7 +161,9 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                     if 'item' not in item_data:
                         raise serializers.ValidationError({'item': 'This field is required.'})
                     po_item = POItem.objects.create(po=instance, **item_data)
-                    total_amount += po_item.total_price
+                    # ✅ Only add to total if total_price is not None
+                    if po_item.total_price is not None:
+                        total_amount += po_item.total_price
                 except Exception as e:
                     raise serializers.ValidationError({
                         'items': f'Error in item {index + 1}: {str(e)}'
@@ -162,8 +174,6 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         return instance
 
 
-        
-
 class ReceivingItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='po_item.item.name', read_only=True)
     po_item_details = POItemSerializer(source='po_item', read_only=True)
@@ -171,7 +181,7 @@ class ReceivingItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReceivingItem
         fields = '__all__'
-        read_only_fields = ['rejected_quantity', 'receiving']  # ✅ Exclude from input
+        read_only_fields = ['rejected_quantity', 'receiving']
 
     def validate(self, data):
         po_item = data.get('po_item')
@@ -180,21 +190,16 @@ class ReceivingItemSerializer(serializers.ModelSerializer):
         
         if received_quantity <= 0:
             raise serializers.ValidationError({'received_quantity': 'Received quantity must be positive.'})
-        
         if accepted_quantity < 0:
             raise serializers.ValidationError({'accepted_quantity': 'Accepted quantity cannot be negative.'})
-        
         if accepted_quantity > received_quantity:
             raise serializers.ValidationError({'accepted_quantity': 'Accepted quantity cannot exceed received quantity.'})
-        
         if accepted_quantity > 0 and not data.get('storage_bin'):
             raise serializers.ValidationError({'storage_bin': 'Storage bin is required for accepted items.'})
-        
         if received_quantity > (po_item.quantity - po_item.received_quantity):
             raise serializers.ValidationError({
                 'received_quantity': f'Cannot receive more than remaining quantity. Remaining: {po_item.quantity - po_item.received_quantity}'
             })
-        
         return data
 
 
@@ -209,56 +214,12 @@ class ReceivingSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = [
             'grn', 'created_at', 'updated_at', 
-            'created_by', 'received_by'  # ✅ Make it read-only
+            'created_by', 'received_by'
         ]
 
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
-        
-        # Create the Receiving instance FIRST
-        receiving = Receiving.objects.create(
-            po=validated_data['po'],
-            invoice_number=validated_data['invoice_number'],
-            invoice_date=validated_data['invoice_date'],
-            notes=validated_data.get('notes', ''),
-            received_by=self.context['request'].user,  # ✅ Auto-set from JWT
-            created_by=self.context['request'].user
-        )
-        
-        # THEN create ReceivingItems linked to it
-        for item_data in items_data:
-            ReceivingItem.objects.create(
-                receiving=receiving,  # ✅ Link to parent
-                **item_data
-            )
-        
-        receiving.update_po_status()
-        return receiving
-
-
-    @transaction.atomic
-    def update(self, instance, validated_data):
-        items_data = validated_data.pop('items', None)
-        instance = super().update(instance, validated_data)
-        
-        if items_data is not None:
-            # Clear existing items and add new ones
-            instance.items.all().delete()
-            for item_data in items_data:
-                ReceivingItem.objects.create(receiving=instance, **item_data)
-            
-            # Update PO status
-            instance.update_po_status()
-        
-        return instance
-
-
-    @transaction.atomic
-    def create(self, validated_data):
-        items_data = validated_data.pop('items', [])
-        
-        # Create Receiving FIRST (without items)
         receiving = Receiving.objects.create(
             po=validated_data['po'],
             invoice_number=validated_data['invoice_number'],
@@ -267,18 +228,22 @@ class ReceivingSerializer(serializers.ModelSerializer):
             received_by=self.context['request'].user,
             created_by=self.context['request'].user
         )
-        
-        # THEN create ReceivingItems linked to it
         for item_data in items_data:
-            ReceivingItem.objects.create(
-                receiving=receiving,
-                **item_data
-            )
-        
+            ReceivingItem.objects.create(receiving=receiving, **item_data)
         receiving.update_po_status()
         return receiving
 
-        
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        instance = super().update(instance, validated_data)
+        if items_data is not None:
+            instance.items.all().delete()
+            for item_data in items_data:
+                ReceivingItem.objects.create(receiving=instance, **item_data)
+            instance.update_po_status()
+        return instance
+
 
 class ProcurementAuditLogSerializer(serializers.ModelSerializer):
     class Meta:
