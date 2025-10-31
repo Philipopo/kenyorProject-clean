@@ -7,6 +7,11 @@ import uuid
 
 User = get_user_model()
 
+CURRENCY_CHOICES = [
+    ('NGN', 'Nigerian Naira (₦)'),
+    ('USD', 'US Dollar ($)'),
+]
+
 class Vendor(models.Model):
     STAR_CHOICES = [(i, f"{i} Star{'s' if i > 1 else ''}") for i in range(1, 6)]
     STATUS_CHOICES = [
@@ -53,9 +58,7 @@ class Vendor(models.Model):
         }
 
 
-
 class ApprovalBoard(models.Model):
-    """Manages users who can approve requisitions and purchase orders"""
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='approval_board_memberships')
     can_approve_requisitions = models.BooleanField(default=False)
     can_approve_purchase_orders = models.BooleanField(default=False)
@@ -73,8 +76,6 @@ class ApprovalBoard(models.Model):
     def clean(self):
         if not (self.can_approve_requisitions or self.can_approve_purchase_orders):
             raise ValidationError("User must be able to approve at least one type of document.")
-
-
 
 
 class Requisition(models.Model):
@@ -103,6 +104,7 @@ class Requisition(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     approved_at = models.DateTimeField(null=True, blank=True)
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='NGN')
 
     class Meta:
         ordering = ['-created_at']
@@ -116,14 +118,12 @@ class Requisition(models.Model):
         return f"{self.code}: {self.department} ({self.status})"
 
     def can_approve(self, user):
-        """Check if user can approve this requisition using ApprovalBoard"""
         try:
             approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
             return approval_member.can_approve_requisitions
         except ApprovalBoard.DoesNotExist:
             return False
 
-    
 
 class RequisitionItem(models.Model):
     requisition = models.ForeignKey(Requisition, on_delete=models.CASCADE, related_name='items')
@@ -141,24 +141,12 @@ class RequisitionItem(models.Model):
         return f"{self.item.name} x {self.quantity}"
 
     def save(self, *args, **kwargs):
-        if self.unit_cost and self.quantity:
+        # Only calculate total if BOTH unit_cost and quantity are present
+        if self.unit_cost is not None and self.quantity is not None:
             self.total_cost = self.unit_cost * self.quantity
+        else:
+            self.total_cost = None
         super().save(*args, **kwargs)
-
-    def to_dict(self):
-        return {
-            'code': self.code,
-            'department': self.department,
-            'purpose': self.purpose,
-            'status': self.status,
-            'priority': self.priority,
-            'requested_by': self.requested_by.email if self.requested_by else None,
-            'approved_by': self.approved_by.email if self.approved_by else None,
-            'total_items': self.items.count(),
-            'total_cost': sum(item.total_cost or 0 for item in self.items.all())
-        }
-
-
 
 
 class PurchaseOrder(models.Model):
@@ -173,7 +161,7 @@ class PurchaseOrder(models.Model):
     ]
     
     code = models.CharField(max_length=100, unique=True, blank=True, null=True)
-    order_number = models.CharField(max_length=100, blank=True, null=True, help_text="Manual order number (optional)")  # ← ADD THIS
+    order_number = models.CharField(max_length=100, blank=True, null=True, help_text="Manual order number (optional)")
     requisition = models.ForeignKey(Requisition, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_orders')
     vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='purchase_orders')
     department = models.CharField(max_length=100)
@@ -191,6 +179,7 @@ class PurchaseOrder(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     approved_at = models.DateTimeField(null=True, blank=True)
     discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='NGN')
     use_inclusive_pricing = models.BooleanField(default=False, null=True, blank=True)
     layout = models.CharField(
         max_length=50,
@@ -198,61 +187,38 @@ class PurchaseOrder(models.Model):
         help_text="Template layout for printing (e.g., 'classic', 'detailed')", null=True, blank=True
     )
 
-    def _recalculate_totals(self):
-        items = self.items.all()
-        subtotal = sum(item.get_subtotal() for item in items)
-        total_vat = sum(item.get_vat_amount() for item in items)
-        total_discount = sum(item.get_discount_amount() for item in items)
-        
-        # Apply global discount
-        global_discount = subtotal * (self.discount_percent / 100)
-        discounted_subtotal = subtotal - global_discount
-        
-        self.total_amount = discounted_subtotal + total_vat
-
     class Meta:
         ordering = ['-created_at']
 
     def save(self, *args, **kwargs):
         if not self.code:
             self.code = f"PO-{uuid.uuid4().hex[:8].upper()}"
-        # Calculate total amount from PO items
+        # Only calculate total_amount if ALL items have unit_price
         if self.pk:
-            self.total_amount = self.items.aggregate(
-                total=models.Sum(models.F('unit_price') * models.F('quantity'))
-            )['total'] or 0
+            total = 0
+            all_have_price = True
+            for item in self.items.all():
+                if item.unit_price is None:
+                    all_have_price = False
+                    break
+                total += item.unit_price * item.quantity
+            self.total_amount = total if all_have_price else None
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.code} - {self.vendor.name} ({self.status})"
 
     def can_approve(self, user):
-        """Check if user can approve this purchase order using ApprovalBoard"""
         try:
             approval_member = ApprovalBoard.objects.get(user=user, is_active=True)
             return approval_member.can_approve_purchase_orders
         except ApprovalBoard.DoesNotExist:
             return False
 
-
     def is_fully_received(self):
-        """Check if all PO items have been received"""
         if not self.items.exists():
             return False
         return all(item.received_quantity >= item.quantity for item in self.items.all())
-
-    def to_dict(self):
-        return {
-            'code': self.code,
-            'vendor': self.vendor.name if self.vendor else None,
-            'department': self.department,
-            'status': self.status,
-            'total_amount': float(self.total_amount),
-            'expected_delivery_date': self.expected_delivery_date.isoformat() if self.expected_delivery_date else None,
-            'total_items': self.items.count()
-        }
-
-
 
 
 class POItem(models.Model):
@@ -260,12 +226,12 @@ class POItem(models.Model):
     item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='po_items')
     quantity = models.PositiveIntegerField()
     received_quantity = models.PositiveIntegerField(default=0)
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     total_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='po_items')
     created_at = models.DateTimeField(auto_now_add=True)
-    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)  # e.g., 7.5 for 7.5%
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
     discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, null=True, blank=True)
 
     class Meta:
@@ -274,33 +240,21 @@ class POItem(models.Model):
     def __str__(self):
         return f"{self.item.name} x {self.quantity} @ {self.unit_price}"
 
-
     def clean(self):
         if self.quantity <= 0:
             raise ValidationError("Quantity must be positive.")
-        if self.unit_price <= 0:
-            raise ValidationError("Unit price must be positive.")
+        # ✅ REMOVED: unit_price validation — it's optional
         if self.received_quantity > self.quantity:
             raise ValidationError("Received quantity cannot exceed ordered quantity.")
 
-    def get_subtotal(self):
-        return self.unit_price * self.quantity
-
-    def get_discount_amount(self):
-        return self.get_subtotal() * (self.discount_percent / 100)
-
-    def get_net_amount(self):
-        return self.get_subtotal() - self.get_discount_amount()
-
-    def get_vat_amount(self):
-        return self.get_net_amount() * (self.vat_rate / 100)
-
-    def get_total(self):
-        return self.get_net_amount() + self.get_vat_amount()
-
     def save(self, *args, **kwargs):
-        self.total_price = self.unit_price * self.quantity
+        # Only calculate total_price if BOTH unit_price and quantity are present
+        if self.unit_price is not None and self.quantity is not None:
+            self.total_price = self.unit_price * self.quantity
+        else:
+            self.total_price = None
         super().save(*args, **kwargs)
+
 
 class Receiving(models.Model):
     STATUS_CHOICES = [
@@ -334,28 +288,12 @@ class Receiving(models.Model):
         return f"Receiving {self.grn} for {self.po.code}"
 
     def update_po_status(self):
-        """Update PO status based on receiving status"""
         po = self.po
         if po.is_fully_received():
             po.status = 'received'
         elif any(r.status == 'complete' for r in po.receivings.all()):
             po.status = 'partially_received'
         po.save()
-
-
-
-
-    def to_dict(self):
-        return {
-            'grn': self.grn,
-            'po_code': self.po.code if self.po else None,
-            'invoice_number': self.invoice_number,
-            'status': self.status,
-            'total_items': self.items.count(),
-            'total_received': sum(item.received_quantity for item in self.items.all())
-        }
-
-
 
 
 class ReceivingItem(models.Model):
@@ -388,12 +326,8 @@ class ReceivingItem(models.Model):
     def save(self, *args, **kwargs):
         self.rejected_quantity = self.received_quantity - self.accepted_quantity
         super().save(*args, **kwargs)
-        
-        # Update PO item received quantity
         self.po_item.received_quantity += self.accepted_quantity
         self.po_item.save()
-        
-        # Update inventory stock if accepted
         if self.accepted_quantity > 0 and self.storage_bin:
             from inventory.models import StockRecord
             stock_record, created = StockRecord.objects.get_or_create(
@@ -404,8 +338,8 @@ class ReceivingItem(models.Model):
             stock_record.quantity += self.accepted_quantity
             stock_record.save()
 
+
 class GoodsReceipt(models.Model):
-    """Legacy model - consider deprecating in favor of Receiving model"""
     po_code = models.CharField(max_length=100)
     grn_code = models.CharField(max_length=100)
     invoice_code = models.CharField(max_length=100)
@@ -416,31 +350,6 @@ class GoodsReceipt(models.Model):
 
     def __str__(self):
         return f"GRN {self.grn_code} for PO {self.po_code}"
-
-# Audit trail for procurement activities
-class ProcurementAuditLog(models.Model):
-    ACTION_CHOICES = [
-        ('create', 'Create'),
-        ('update', 'Update'),
-        ('delete', 'Delete'),
-        ('approve', 'Approve'),
-        ('reject', 'Reject'),
-        ('receive', 'Receive'),
-    ]
-    
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
-    model_name = models.CharField(max_length=50)
-    object_id = models.PositiveIntegerField()
-    details = models.JSONField(default=dict)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"{self.user.email} {self.action} {self.model_name} {self.object_id}"
-
 
 
 class ProcurementAuditLog(models.Model):
@@ -465,6 +374,8 @@ class ProcurementAuditLog(models.Model):
     class Meta:
         ordering = ['-created_at']
 
+    def __str__(self):
+        return f"{self.user.email} {self.action} {self.model_name} {self.object_id}"
 
 
 
@@ -492,8 +403,16 @@ class ProcurementAuditLog(models.Model):
 
 
 
-urls:
 
+
+
+
+
+
+
+
+
+# procurement/urls.py
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
@@ -519,6 +438,27 @@ urlpatterns = [
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # procurement/serializers.py
 from rest_framework import serializers
 from django.db import transaction
@@ -528,7 +468,9 @@ from .models import (
     Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
 )
 from inventory.serializers import ItemSerializer
+
 User = get_user_model()
+
 
 class ApprovalBoardSerializer(serializers.ModelSerializer):
     user_email = serializers.CharField(source='user.email', read_only=True)
@@ -539,6 +481,7 @@ class ApprovalBoardSerializer(serializers.ModelSerializer):
         model = ApprovalBoard
         fields = '__all__'
         read_only_fields = ['added_by', 'added_at']
+
 
 class VendorSerializer(serializers.ModelSerializer):
     class Meta:
@@ -551,6 +494,7 @@ class VendorSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'lead_time': 'Lead time must be positive.'})
         return data
 
+
 class RequisitionItemSerializer(serializers.ModelSerializer):
     item_details = ItemSerializer(source='item', read_only=True)
     
@@ -562,7 +506,9 @@ class RequisitionItemSerializer(serializers.ModelSerializer):
     def validate(self, data):
         if data.get('quantity', 0) <= 0:
             raise serializers.ValidationError({'quantity': 'Quantity must be positive.'})
-        if data.get('unit_cost', 0) <= 0:
+        # ✅ unit_cost is optional — only validate if provided
+        unit_cost = data.get('unit_cost')
+        if unit_cost is not None and unit_cost <= 0:
             raise serializers.ValidationError({'unit_cost': 'Unit cost must be positive.'})
         return data
 
@@ -578,23 +524,25 @@ class RequisitionSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = [
             'code', 'approved_by', 'created_at', 'updated_at', 'approved_at',
-            'requested_by', 'created_by'
+            'requested_by', 'created_by',
+            'currency'  # ← immutable after creation
         ]
 
+    def update(self, instance, validated_data):
+        # Prevent currency change after creation
+        if 'currency' in validated_data and instance.pk:
+            validated_data.pop('currency')
+        return super().update(instance, validated_data)
 
     def create(self, validated_data):
-        # Automatically set requested_by and created_by from request user
         user = self.context['request'].user
         validated_data['requested_by'] = user
         validated_data['created_by'] = user
         items_data = validated_data.pop('items', [])
         requisition = Requisition.objects.create(**validated_data)
-        
         for item_data in items_data:
             RequisitionItem.objects.create(requisition=requisition, **item_data)
-        
         return requisition
-
 
 
 class POItemSerializer(serializers.ModelSerializer):
@@ -608,9 +556,12 @@ class POItemSerializer(serializers.ModelSerializer):
     def validate(self, data):
         if data.get('quantity', 0) <= 0:
             raise serializers.ValidationError({'quantity': 'Quantity must be positive.'})
-        if data.get('unit_price', 0) <= 0:
+        # ✅ unit_price is optional — only validate if provided
+        unit_price = data.get('unit_price')
+        if unit_price is not None and unit_price <= 0:
             raise serializers.ValidationError({'unit_price': 'Unit price must be positive.'})
         return data
+
 
 class PurchaseOrderSerializer(serializers.ModelSerializer):
     items = POItemSerializer(many=True, required=False)
@@ -625,22 +576,19 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             'code', 'total_amount', 'approved_by', 'created_at',
             'updated_at', 'approved_at', 'created_by'
         ]
-        # Do NOT include 'layout' in read_only_fields
 
     def validate(self, data):
         if not data.get('vendor'):
             raise serializers.ValidationError({'vendor': 'Vendor is required.'})
-        
         if self.context['request'].method == 'POST' and data.get('status', 'draft') != 'draft':
             if not self.initial_data.get('items') or len(self.initial_data.get('items', [])) == 0:
                 raise serializers.ValidationError({'items': 'At least one item is required.'})
-        
         return data
 
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
-        validated_data['created_by'] = self.context['request'].user  # Set created_by
+        validated_data['created_by'] = self.context['request'].user
         po = PurchaseOrder.objects.create(**validated_data)
         
         total_amount = 0
@@ -649,7 +597,9 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                 if 'item' not in item_data:
                     raise serializers.ValidationError({'item': 'This field is required.'})
                 po_item = POItem.objects.create(po=po, **item_data)
-                total_amount += po_item.total_price
+                # ✅ Only add to total if total_price is not None
+                if po_item.total_price is not None:
+                    total_amount += po_item.total_price
             except Exception as e:
                 raise serializers.ValidationError({
                     'items': f'Error in item {index + 1}: {str(e)}'
@@ -672,7 +622,9 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                     if 'item' not in item_data:
                         raise serializers.ValidationError({'item': 'This field is required.'})
                     po_item = POItem.objects.create(po=instance, **item_data)
-                    total_amount += po_item.total_price
+                    # ✅ Only add to total if total_price is not None
+                    if po_item.total_price is not None:
+                        total_amount += po_item.total_price
                 except Exception as e:
                     raise serializers.ValidationError({
                         'items': f'Error in item {index + 1}: {str(e)}'
@@ -683,8 +635,6 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         return instance
 
 
-        
-
 class ReceivingItemSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='po_item.item.name', read_only=True)
     po_item_details = POItemSerializer(source='po_item', read_only=True)
@@ -692,7 +642,7 @@ class ReceivingItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReceivingItem
         fields = '__all__'
-        read_only_fields = ['rejected_quantity', 'receiving']  # ✅ Exclude from input
+        read_only_fields = ['rejected_quantity', 'receiving']
 
     def validate(self, data):
         po_item = data.get('po_item')
@@ -701,21 +651,16 @@ class ReceivingItemSerializer(serializers.ModelSerializer):
         
         if received_quantity <= 0:
             raise serializers.ValidationError({'received_quantity': 'Received quantity must be positive.'})
-        
         if accepted_quantity < 0:
             raise serializers.ValidationError({'accepted_quantity': 'Accepted quantity cannot be negative.'})
-        
         if accepted_quantity > received_quantity:
             raise serializers.ValidationError({'accepted_quantity': 'Accepted quantity cannot exceed received quantity.'})
-        
         if accepted_quantity > 0 and not data.get('storage_bin'):
             raise serializers.ValidationError({'storage_bin': 'Storage bin is required for accepted items.'})
-        
         if received_quantity > (po_item.quantity - po_item.received_quantity):
             raise serializers.ValidationError({
                 'received_quantity': f'Cannot receive more than remaining quantity. Remaining: {po_item.quantity - po_item.received_quantity}'
             })
-        
         return data
 
 
@@ -730,56 +675,12 @@ class ReceivingSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = [
             'grn', 'created_at', 'updated_at', 
-            'created_by', 'received_by'  # ✅ Make it read-only
+            'created_by', 'received_by'
         ]
 
     @transaction.atomic
     def create(self, validated_data):
         items_data = validated_data.pop('items', [])
-        
-        # Create the Receiving instance FIRST
-        receiving = Receiving.objects.create(
-            po=validated_data['po'],
-            invoice_number=validated_data['invoice_number'],
-            invoice_date=validated_data['invoice_date'],
-            notes=validated_data.get('notes', ''),
-            received_by=self.context['request'].user,  # ✅ Auto-set from JWT
-            created_by=self.context['request'].user
-        )
-        
-        # THEN create ReceivingItems linked to it
-        for item_data in items_data:
-            ReceivingItem.objects.create(
-                receiving=receiving,  # ✅ Link to parent
-                **item_data
-            )
-        
-        receiving.update_po_status()
-        return receiving
-
-
-    @transaction.atomic
-    def update(self, instance, validated_data):
-        items_data = validated_data.pop('items', None)
-        instance = super().update(instance, validated_data)
-        
-        if items_data is not None:
-            # Clear existing items and add new ones
-            instance.items.all().delete()
-            for item_data in items_data:
-                ReceivingItem.objects.create(receiving=instance, **item_data)
-            
-            # Update PO status
-            instance.update_po_status()
-        
-        return instance
-
-
-    @transaction.atomic
-    def create(self, validated_data):
-        items_data = validated_data.pop('items', [])
-        
-        # Create Receiving FIRST (without items)
         receiving = Receiving.objects.create(
             po=validated_data['po'],
             invoice_number=validated_data['invoice_number'],
@@ -788,18 +689,22 @@ class ReceivingSerializer(serializers.ModelSerializer):
             received_by=self.context['request'].user,
             created_by=self.context['request'].user
         )
-        
-        # THEN create ReceivingItems linked to it
         for item_data in items_data:
-            ReceivingItem.objects.create(
-                receiving=receiving,
-                **item_data
-            )
-        
+            ReceivingItem.objects.create(receiving=receiving, **item_data)
         receiving.update_po_status()
         return receiving
 
-        
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        instance = super().update(instance, validated_data)
+        if items_data is not None:
+            instance.items.all().delete()
+            for item_data in items_data:
+                ReceivingItem.objects.create(receiving=instance, **item_data)
+            instance.update_po_status()
+        return instance
+
 
 class ProcurementAuditLogSerializer(serializers.ModelSerializer):
     class Meta:
@@ -819,7 +724,20 @@ class ProcurementAuditLogSerializer(serializers.ModelSerializer):
 
 
 
-view.py:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -830,6 +748,7 @@ from django.http import HttpResponse
 from django.conf import settings
 from datetime import datetime
 from io import BytesIO
+
 
 # ReportLab imports for PDF generation
 from reportlab.lib import colors
@@ -842,7 +761,7 @@ from reportlab.lib.units import inch
 
 from .models import (
     Requisition, RequisitionItem, PurchaseOrder, POItem, 
-    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard
+    Receiving, ReceivingItem, Vendor, ProcurementAuditLog, ApprovalBoard, CURRENCY_CHOICES
 )
 from .serializers import (
     RequisitionSerializer, PurchaseOrderSerializer, 
@@ -1346,17 +1265,25 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         po.approved_at = datetime.now()
         po.save()
         
-        # TEMPORARILY COMMENTED OUT - Audit logging disabled
-        # log_procurement_action(
-        #     user=request.user,
-        #     action='approve',
-        #     model_name='PurchaseOrder',
-        #     object_id=po.id,
-        #     instance=po,
-        #     details={'status_change': f'{old_status} -> approved'}
-        # )
-        
         return Response({'status': 'approved'})
+
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Return summary statistics for all purchase orders"""
+        total = PurchaseOrder.objects.count()
+        pending = PurchaseOrder.objects.filter(status='submitted').count()
+        approved = PurchaseOrder.objects.filter(status='approved').count()
+        rejected = PurchaseOrder.objects.filter(status='rejected').count()
+
+        return Response({
+            'total': total,
+            'pending': pending,
+            'approved': approved,
+            'rejected': rejected,
+        })
+
+        
 
     @action(detail=True, methods=['get'])
     def export_pdf(self, request, pk=None):
@@ -1390,6 +1317,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             'SmallInfo', parent=styles['Normal'],
             fontSize=9, leading=12, textColor=colors.black
         )
+
+        wrapped_style = ParagraphStyle(
+            'Wrapped',
+            parent=styles['Normal'],
+            fontSize=9,
+            leading=12,
+            wordWrap='CJK',  # enables multi-line wrapping
+            textColor=colors.black,
+        )
+
 
         # === Header Section ===
         if hasattr(settings, 'COMPANY_LOGO_PATH'):
@@ -1522,6 +1459,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             ["Expected Delivery", po.expected_delivery_date.strftime('%d/%m/%Y') if po.expected_delivery_date else "—"],
             ["Payment Terms", po.payment_terms or "—"],
             ["Status", po.get_status_display() or "—"],
+            ["Currency", dict(CURRENCY_CHOICES).get(po.currency, po.currency)],
         ]
         po_table = Table(po_details, colWidths=[2.0*inch, 4.1*inch])
         po_table.setStyle(TableStyle([
@@ -1542,36 +1480,49 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         elements.append(Paragraph("<b>ITEMS</b>", section_heading))
         elements.append(Spacer(1, 6))
 
-        item_headers = ["Item", "Description", "Qty", "Unit Price (₦)", "Total (₦)"]
+        currency_symbol = '₦' if po.currency == 'NGN' else '$'
+        item_headers = ["Item", "Description", "Qty", f"Unit Price ({currency_symbol})", f"Total ({currency_symbol})"]
+
         item_data = [item_headers]
 
         total_amount = 0
         for item in po.items.all():
-            total = item.quantity * item.unit_price
+            unit_price = item.unit_price if item.unit_price is not None else 0
+            total = item.quantity * unit_price
             total_amount += total
+
             item_data.append([
                 item.item.name if item.item else "—",
                 getattr(item, 'notes', '') or "—",
                 str(item.quantity),
-                f"{item.unit_price:.2f}",
-                f"{total:.2f}"
+                f"{item.unit_price:.2f}" if item.unit_price is not None else "—",
+                f"{total:.2f}" if total > 0 else "—"
             ])
+
+           
 
         # Add total row
         item_data.append(["", "", "", "TOTAL:", f"{total_amount:.2f}"])
 
-        item_table = Table(item_data, colWidths=[1.2*inch, 2.0*inch, 0.8*inch, 1.0*inch, 1.1*inch])
+        item_table = Table(
+            item_data,
+            colWidths=[1.2*inch, 2.0*inch, 0.8*inch, 1.0*inch, 1.1*inch],
+            repeatRows=1
+        )
         item_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#E0E0E0")),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
             ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('GRID', (0, 0), (-1, -2), 0.35, colors.HexColor("#D0D0D0")),
             ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
             ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
             ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#F6F6F6")),
             ('TOPPADDING', (0, 0), (-1, -1), 6),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
         ]))
         elements.append(item_table)
         elements.append(Spacer(1, 12))

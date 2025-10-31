@@ -47,6 +47,7 @@ urlpatterns = [
     path('api/activity/', include('activity_log.urls')),
     path('api/warehouse_new/', include(('warehouse_new.urls', 'warehouse_new'), namespace='warehouse_new')),
     path('api/product-documentation-new/', include('product_documentation_new.urls')),
+    path('api/analyticsnew/', include('analyticsnew.urls')),
 ] 
 
 if settings.DEBUG:

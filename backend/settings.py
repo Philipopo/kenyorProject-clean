@@ -71,6 +71,7 @@ INSTALLED_APPS = [
     'chat',
     'activity_log',
     'product_documentation_new',
+    'analyticsnew'
 ]
 
 ASGI_APPLICATION = 'backend.asgi.application'

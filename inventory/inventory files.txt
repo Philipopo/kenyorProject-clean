@@ -1,5 +1,3 @@
-serializer.py:
-
 from rest_framework import serializers
 from django.db import transaction
 from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem, InventoryActivityLog, WarehouseReceipt
@@ -608,7 +606,23 @@ class WarehouseReceiptSerializer(serializers.ModelSerializer):
 
 
 
-models.py:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 from django.db import models
@@ -1023,6 +1037,18 @@ class WarehouseReceipt(models.Model):
             self.plant_site = self.issued_from_warehouse.code
             self.qty_remaining = self.item.available_quantity()
         super().save(*args, **kwargs)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2237,7 +2263,23 @@ class WarehouseReceiptViewSet(viewsets.ModelViewSet):
 
 
 
-urls.py:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
