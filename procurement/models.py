@@ -67,7 +67,7 @@ class ApprovalBoard(models.Model):
     is_active = models.BooleanField(default=True)
     
     class Meta:
-        unique_together = ['user']
+       
         ordering = ['user__name', 'user__email']
     
     def __str__(self):

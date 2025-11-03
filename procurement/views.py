@@ -329,35 +329,27 @@ class RequisitionViewSet(viewsets.ModelViewSet):
         #     details={'deleted_requisition': instance_data}
         # )
 
+   
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         requisition = self.get_object()
+        if requisition.status != 'submitted':
+            return Response(
+                {'error': f'Requisition is already {requisition.status}. No further action allowed.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         if not requisition.can_approve(request.user):
-            return Response({'error': 'You do not have permission to approve this requisition.'}, 
-                        status=status.HTTP_403_FORBIDDEN)
-        
+            return Response(
+                {'error': 'You do not have permission to approve this requisition.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         requisition.status = 'approved'
         requisition.approved_by = request.user
         requisition.approved_at = datetime.now()
         requisition.save()
-        
-        # TEMPORARILY COMMENTED OUT - Manual audit log creation disabled
-        # Convert datetime to string for JSON serialization
-        # approved_at_str = requisition.approved_at.isoformat() if requisition.approved_at else None
-        # 
-        # ProcurementAuditLog.objects.create(
-        #     user=request.user,
-        #     action='approve',
-        #     model_name='Requisition',
-        #     object_id=requisition.id,
-        #     details={
-        #         'status': 'approved',
-        #         'approved_at': approved_at_str,
-        #         'requisition_code': requisition.code
-        #     }
-        # )
-        
-        return Response({'status': 'approved'})
+        return Response({'status': 'approved', 'id': requisition.id})
+
+
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
