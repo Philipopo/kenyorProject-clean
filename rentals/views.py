@@ -1,5 +1,6 @@
 # rentals/views.py
 import logging
+import uuid
 from io import BytesIO
 from datetime import datetime
 from django.http import HttpResponse
@@ -325,6 +326,7 @@ class RentalPaymentViewSet(ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+
 class EquipmentReportPDFView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -341,20 +343,95 @@ class EquipmentReportPDFView(APIView):
         )
         elements = []
         styles = getSampleStyleSheet()
+
+        # --- MATCH RENTAL RECEIPT STYLES ---
         title_style = ParagraphStyle(
             'ReportTitle', parent=styles['Heading1'],
-            fontSize=16, alignment=1, spaceAfter=12, leading=20,
+            fontSize=16, alignment=1, spaceAfter=8, leading=20,
             textColor=colors.HexColor("#333333")
         )
         section_heading = ParagraphStyle(
             'SectionHeading', parent=styles['Heading3'],
-            fontSize=11, spaceBefore=8, spaceAfter=6,
-            textColor=colors.HexColor("#2b2b2b")
+            fontSize=10.5, spaceBefore=6, spaceAfter=6,
+            textColor=colors.HexColor("#2b2b2b"), leading=13
         )
-        normal = styles['Normal']
-        elements.append(Paragraph("EQUIPMENT INVENTORY REPORT", title_style))
-        elements.append(Paragraph(f"Generated on: {timezone.now().strftime('%d/%m/%Y %H:%M')}", normal))
+        small_info = ParagraphStyle(
+            'SmallInfo', parent=styles['Normal'],
+            fontSize=9, leading=12, textColor=colors.black
+        )
+        # Style for wrapped table cells
+        cell_style = ParagraphStyle(
+            'TableCell',
+            parent=styles['Normal'],
+            fontSize=9,
+            leading=11,
+            wordWrap='CJK'
+        )
+
+        # --- HEADER (IDENTICAL TO RENTAL RECEIPT) ---
+        current_date = timezone.now().strftime('%d/%m/%Y %H:%M')
+        report_number = f"EQP-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+        try:
+            if hasattr(settings, 'COMPANY_LOGO_PATH'):
+                logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.0 * inch, height=0.6 * inch)
+                header_table = Table([[  
+                    logo_img,
+                    Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/><span>{getattr(settings, 'COMPANY_TAGLINE', '')}</span>", styles['Title']),
+                    Paragraph(
+                        f"<b>Report No.</b><br/>{report_number}<br/><br/>"
+                        f"<b>Date</b><br/>{current_date}",
+                        small_info
+                    )
+                ]], colWidths=[1.0 * inch, 4.3 * inch, 2.2 * inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+            else:
+                raise Exception("No company logo configured")
+        except Exception as e:
+            logger.warning(f"Logo load failed or no logo configured: {e}")
+            header_table = Table([[  
+                Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b>", styles['Title']),
+                Paragraph(
+                    f"<b>Report No.</b><br/>{report_number}<br/><br/>"
+                    f"<b>Date</b><br/>{current_date}",
+                    small_info
+                )
+            ]], colWidths=[5.3 * inch, 2.2 * inch])
+            header_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+            ]))
+            elements.append(header_table)
+
         elements.append(Spacer(1, 12))
+        elements.append(Paragraph("EQUIPMENT INVENTORY REPORT", title_style))
+        elements.append(Spacer(1, 8))
+
+        # --- EQUIPMENT TABLE (WITH WRAPPING) ---
+        elements.append(Paragraph("<b>EQUIPMENT LIST</b>", section_heading))
+        elements.append(Spacer(1, 6))
+
         table_data = [
             ["#", "Name", "Category", "Branch", "Total Qty", "Available Qty", "Status", "Expiry"]
         ]
@@ -365,26 +442,52 @@ class EquipmentReportPDFView(APIView):
                 expiry = f"EXPIRED ({expiry})"
             table_data.append([
                 str(idx),
-                eq.name,
-                eq.category,
-                eq.branch.name if eq.branch else "—",
+                Paragraph(eq.name or "—", cell_style),
+                Paragraph(eq.category or "—", cell_style),
+                Paragraph(eq.branch.name if eq.branch else "—", cell_style),
                 str(eq.total_quantity),
                 str(eq.available_quantity),
-                status,
-                expiry
+                Paragraph(status, cell_style),
+                Paragraph(expiry, cell_style)
             ])
-        col_widths = [0.4 * inch, 1.5 * inch, 1.0 * inch, 1.2 * inch, 0.8 * inch, 0.9 * inch, 1.0 * inch, 1.2 * inch]
+
+        # Adjusted column widths to fit 8 columns
+        col_widths = [0.4 * inch, 1.3 * inch, 0.9 * inch, 1.1 * inch, 0.7 * inch, 0.8 * inch, 0.9 * inch, 1.1 * inch]
         table = Table(table_data, colWidths=col_widths)
         table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#4CAF50")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F3F3F3")),  # Header
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#FAFAFA")),  # Data
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('WORDWRAP', (1, 1), (7, -1), 'CJK'),  # Wrap all text columns
         ]))
         elements.append(table)
+        elements.append(Spacer(1, 18))
+
+        # --- FOOTER (IDENTICAL TO RENTAL RECEIPT) ---
+        footer_table = Table([[  
+            Paragraph("<i>This equipment inventory report is auto-generated.</i>", styles['Italic']),
+            Paragraph(f"{getattr(settings, 'COMPANY_NAME', '')}", small_info)
+        ]], colWidths=[4.6 * inch, 2.0 * inch])
+        footer_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#333333")),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.whitesmoke),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(footer_table)
+
+        # --- BUILD PDF ---
         doc.build(elements)
         buffer.seek(0)
         response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
