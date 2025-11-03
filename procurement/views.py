@@ -333,11 +333,7 @@ class RequisitionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         requisition = self.get_object()
-        if requisition.status != 'submitted':
-            return Response(
-                {'error': f'Requisition is already {requisition.status}. No further action allowed.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        
         if not requisition.can_approve(request.user):
             return Response(
                 {'error': 'You do not have permission to approve this requisition.'},
