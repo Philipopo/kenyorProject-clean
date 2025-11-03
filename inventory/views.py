@@ -3,9 +3,7 @@ from django.conf import settings
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.decorators import permission_classes
-from rest_framework.decorators import api_view  # ← ADD THIS LINE
-from rest_framework.decorators import action
+from rest_framework.decorators import permission_classes, api_view, action
 from rest_framework.exceptions import PermissionDenied
 from django.db.models import Q, Sum, Count
 from rest_framework.pagination import PageNumberPagination
@@ -14,15 +12,12 @@ from django.db import transaction
 import logging
 from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem, InventoryActivityLog, WarehouseReceipt
 from .serializers import (
-    WarehouseSerializer, StorageBinSerializer, ItemSerializer, StockRecordSerializer, 
-    StockMovementSerializer, InventoryAlertSerializer, ExpiryTrackedItemSerializer, 
+    WarehouseSerializer, StorageBinSerializer, ItemSerializer, StockRecordSerializer,
+    StockMovementSerializer, InventoryAlertSerializer, ExpiryTrackedItemSerializer,
     StockInSerializer, StockOutSerializer, InventoryActivityLogSerializer, WarehouseReceiptSerializer
 )
-
 from accounts.permissions import APIKeyPermission
 from accounts.models import PagePermission, ActionPermission
-from django.http import JsonResponse
-from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import render, get_object_or_404
 from django.contrib.auth.decorators import login_required
@@ -30,13 +25,10 @@ from io import BytesIO
 from django.http import HttpResponse
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-
-
+from rest_framework.permissions import IsAuthenticated
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +111,11 @@ class ItemViewSet(viewsets.ModelViewSet):
         queryset = Item.objects.all().order_by('-id')
         search = self.request.query_params.get('search', '').strip()
         if search:
-            queryset = queryset.filter(Q(name__icontains=search) | Q(part_number__icontains=search))
+            queryset = queryset.filter(
+                Q(name__icontains=search) |
+                Q(part_number__icontains=search) |
+                Q(material_id__icontains=search)
+            )
         return queryset
 
     def perform_create(self, serializer):
@@ -150,33 +146,291 @@ class ItemViewSet(viewsets.ModelViewSet):
         check_permission(self.request.user, action="delete_item")
         if instance.stock_records.exists():
             raise PermissionDenied("Cannot delete item with stock records.")
-        
         item_name = instance.name
         instance.delete()
         log_activity(
             user=self.request.user,
             action='delete',
             model_name='Item',
-            object_id=instance.id,
+            object_id=None,  # Already deleted
             object_name=item_name,
             details={'deleted_item': item_name}
         )
 
+    @action(detail=False, methods=['post'], url_path='bulk-delete')
+    def bulk_delete(self, request):
+        logger.info(f"Bulk delete action called with data: {request.data}")
+        try:
+            check_permission(request.user, action="delete_item")
+            item_ids = request.data.get('item_ids', [])
 
-    def get_queryset(self):
-        check_permission(self.request.user, page="items")
-        queryset = Item.objects.all().order_by('-id')
-        search = self.request.query_params.get('search', '').strip()
-        if search:
-            queryset = queryset.filter(
-                Q(name__icontains=search) |
-                Q(part_number__icontains=search) |
-                Q(material_id__icontains=search)  # ← Add this
+            if not isinstance(item_ids, list) or not item_ids:
+                logger.error(f"Bulk delete failed: item_ids is {item_ids}")
+                return Response({'error': 'item_ids must be a non-empty list'}, status=status.HTTP_400_BAD_REQUEST)
+
+            items = Item.objects.filter(id__in=item_ids)
+            found_ids = set(items.values_list('id', flat=True))
+            logger.info(f"Bulk delete: Requested IDs {item_ids}, Found IDs {found_ids}")
+
+            missing = set(item_ids) - found_ids
+            if missing:
+                logger.warning(f"Bulk delete: Items not found: {missing}")
+                return Response({'error': f'Items not found: {missing}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            items_with_stock = [item.id for item in items if item.stock_records.exists()]
+            if items_with_stock:
+                logger.warning(f"Bulk delete: Items with stock records: {items_with_stock}")
+                return Response({
+                    'error': 'Cannot delete items with stock records.',
+                    'items_with_stock': items_with_stock
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                deleted_names = []
+                deleted_count = 0
+                for item in items:
+                    deleted_names.append(item.name)
+                    item.delete()
+                    deleted_count += 1
+
+                for name in deleted_names:
+                    try:
+                        log_activity(
+                            user=request.user,
+                            action='delete',
+                            model_name='Item',
+                            object_id=None,  # Explicitly allow None
+                            object_name=name,
+                            details={'bulk_deleted_item': name}
+                        )
+                    except Exception as log_error:
+                        logger.error(f"Failed to log activity for {name}: {str(log_error)}")
+                        # Continue despite logging error
+
+            logger.info(f"Bulk delete: Successfully deleted {deleted_count} items")
+            return Response({'message': f'{deleted_count} items deleted successfully'}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Bulk delete failed: {str(e)}")
+            return Response({'error': f'Operation failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+    @action(detail=False, methods=['get'], url_path='export-pdf')
+    def export_pdf(self, request):
+        logger.info("Export PDF action called")
+        try:
+            check_permission(request.user, action="view_item")
+            items = Item.objects.all().order_by('id')
+            if not items.exists():
+                return Response({'error': 'No items found'}, status=status.HTTP_404_NOT_FOUND)
+
+            buffer = BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                topMargin=0.75 * inch,
+                bottomMargin=0.75 * inch,
+                leftMargin=0.75 * inch,
+                rightMargin=0.75 * inch
             )
-        return queryset
-    
+            elements = []
+            styles = getSampleStyleSheet()
+
+            # Define styles
+            title_style = ParagraphStyle(
+                'ReportTitle', parent=styles['Heading1'],
+                fontSize=16, alignment=1, spaceAfter=8, leading=20,
+                textColor=colors.HexColor("#333333")
+            )
+            section_heading = ParagraphStyle(
+                'SectionHeading', parent=styles['Heading3'],
+                fontSize=10.5, spaceBefore=6, spaceAfter=6,
+                textColor=colors.HexColor("#2b2b2b"), leading=13
+            )
+            small_info = ParagraphStyle(
+                'SmallInfo', parent=styles['Normal'],
+                fontSize=9, leading=12, textColor=colors.black
+            )
+
+            # Header with logo (if available), company name, and date
+            from datetime import datetime
+            current_date = datetime.now().strftime('%d/%m/%Y %H:%M')
+            if hasattr(settings, 'COMPANY_LOGO_PATH'):
+                try:
+                    logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.5*inch, height=0.8*inch)
+                    header_table = Table([[
+                        logo_img,
+                        Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}</b><br/><span>{getattr(settings, 'COMPANY_TAGLINE', '')}</span>", styles['Title']),
+                        Paragraph(f"<b>Date</b><br/>{current_date}", small_info)
+                    ]], colWidths=[1.5*inch, 3.8*inch, 2.2*inch])
+                    header_table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                        ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                        ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
+                        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                        ('TOPPADDING', (0, 0), (-1, -1), 10),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                    ]))
+                    elements.append(header_table)
+                except Exception as e:
+                    logger.warning(f"Logo not found or failed to load: {str(e)}")
+                    header_table = Table([[
+                        Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}</b>", styles['Title']),
+                        Paragraph(f"<b>Date</b><br/>{current_date}", small_info)
+                    ]], colWidths=[5.0*inch, 2.2*inch])
+                    header_table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                        ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                        ('TOPPADDING', (0, 0), (-1, -1), 10),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                    ]))
+                    elements.append(header_table)
+            else:
+                header_table = Table([[
+                    Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}</b>", styles['Title']),
+                    Paragraph(f"<b>Date</b><br/>{current_date}", small_info)
+                ]], colWidths=[5.0*inch, 2.2*inch])
+                header_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                    ('BACKGROUND', (1, 0), (1, 0), colors.HexColor("#F6F6F6")),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                    ('TOPPADING', (0, 0), (-1, -1), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                    ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
+                ]))
+                elements.append(header_table)
+
+            elements.append(Spacer(1, 12))
+            elements.append(Paragraph("INVENTORY ITEMS REPORT", title_style))
+            elements.append(Spacer(1, 8))
+
+            # Item table
+            elements.append(Paragraph("<b>ITEMS</b>", section_heading))
+            elements.append(Spacer(1, 6))
+            item_data = [["ID", "Material ID", "Name", "po_number", "min_stock"]]
+            for item in items:
+                item_data.append([
+                    str(item.id),
+                    item.material_id or "—",
+                    item.name or "—",
+                    item.po_number or "—",
+                    item.min_stock_level or "—"
+                ])
+            item_table = Table(item_data, colWidths=[0.5*inch, 1.0*inch, 1.5*inch, 1.0*inch, 1.5*inch, 2.0*inch])
+            item_table.setStyle(TableStyle([
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F3F3F3")),  # Header row
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#FAFAFA")),  # Data rows
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            elements.append(item_table)
+            elements.append(Spacer(1, 18))
+
+            # Footer
+            footer_table = Table([[
+                Paragraph("<i>This document is auto-generated.</i>", styles['Italic']),
+                Paragraph(f"{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}", small_info)
+            ]], colWidths=[4.6*inch, 2.0*inch])
+            footer_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#333333")),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.whitesmoke),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 10),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ]))
+            elements.append(footer_table)
+
+            doc.build(elements)
+            buffer.seek(0)
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = 'attachment; filename="inventory_items_report.pdf"'
+            return response
+        except Exception as e:
+            logger.error(f"PDF export error: {str(e)}")
+            return Response({'error': 'Failed to generate PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+
+class BulkDeleteItemsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        logger.info(f"Standalone BulkDeleteItemsView called with data: {request.data}")
+        try:
+            check_permission(request.user, action="delete_item")
+            item_ids = request.data.get('item_ids', [])
+
+            if not isinstance(item_ids, list) or not item_ids:
+                logger.error(f"Bulk delete failed: item_ids is {item_ids}")
+                return Response({'error': 'item_ids must be a non-empty list'}, status=status.HTTP_400_BAD_REQUEST)
+
+            items = Item.objects.filter(id__in=item_ids)
+            found_ids = set(items.values_list('id', flat=True))
+            logger.info(f"Bulk delete: Requested IDs {item_ids}, Found IDs {found_ids}")
+
+            missing = set(item_ids) - found_ids
+            if missing:
+                logger.warning(f"Bulk delete: Items not found: {missing}")
+                return Response({'error': f'Items not found: {missing}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            items_with_stock = [item.id for item in items if item.stock_records.exists()]
+            if items_with_stock:
+                logger.warning(f"Bulk delete: Items with stock records: {items_with_stock}")
+                return Response({
+                    'error': 'Cannot delete items with stock records.',
+                    'items_with_stock': items_with_stock
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                deleted_names = []
+                deleted_count = 0
+                for item in items:
+                    deleted_names.append(item.name)
+                    item.delete()
+                    deleted_count += 1
+
+                for name in deleted_names:
+                    try:
+                        log_activity(
+                            user=request.user,
+                            action='delete',
+                            model_name='Item',
+                            object_id=None,
+                            object_name=name,
+                            details={'bulk_deleted_item': name}
+                        )
+                    except Exception as log_error:
+                        logger.error(f"Failed to log activity for {name}: {str(log_error)}")
+                        # Continue despite logging error
+
+            logger.info(f"Bulk delete: Successfully deleted {deleted_count} items")
+            return Response({'message': f'{deleted_count} items deleted successfully'}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Bulk delete failed: {str(e)}")
+            return Response({'error': f'Operation failed: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 
@@ -189,27 +443,27 @@ class ImportCSVView(APIView):
         try:
             check_permission(request.user, action="create_item")
             check_permission(request.user, action="import_items_csv")
-            
+
             if 'file' not in request.FILES:
                 return Response({'error': 'No file provided'}, status=400)
-            
+
             file = request.FILES['file']
-            
+
             # Validate file type
             if not file.name.endswith('.csv'):
                 return Response({'error': 'Only CSV files are allowed'}, status=400)
-            
+
             try:
                 # Decode and read CSV
                 decoded_file = file.read().decode('utf-8').splitlines()
                 csv_reader = csv.DictReader(decoded_file)
-                
+
                 created_items = []
                 errors = []
-                
+
                 # Required fields (adjust based on your Item model)
                 required_fields = ['name', 'part_number', 'manufacturer', 'contact', 'material', 'grade']
-                
+
                 for row_num, row in enumerate(csv_reader, start=2):  # Start at 2 (header is row 1)
                     try:
                         # Validate required fields
@@ -217,7 +471,7 @@ class ImportCSVView(APIView):
                         if missing_fields:
                             errors.append(f"Row {row_num}: Missing required fields: {', '.join(missing_fields)}")
                             continue
-                        
+
                         # Create item
                         item_data = {
                             'name': row['name'].strip(),
@@ -232,20 +486,22 @@ class ImportCSVView(APIView):
                                 'Grade': row.get('grade', '').strip()
                             }
                         }
-                        
+
                         # Handle optional fields
                         if row.get('batch'):
                             item_data['batch'] = row['batch'].strip()
                         if row.get('expiry_date'):
                             item_data['expiry_date'] = row['expiry_date'].strip()
-                        
+                        if row.get('po_number'):
+                            item_data['po_number'] = row['po_number'].strip()
+
                         # Create the item
                         item = Item.objects.create(
                             user=request.user,
                             **item_data
                         )
                         created_items.append(item.name)
-                        
+
                         # Log activity
                         log_activity(
                             user=request.user,
@@ -255,38 +511,32 @@ class ImportCSVView(APIView):
                             object_name=item.name,
                             details={'source': 'CSV import', 'part_number': item.part_number}
                         )
-                        
+
                     except Exception as e:
                         errors.append(f"Row {row_num}: {str(e)}")
-                
+
                 result = {
                     'success': f'Successfully imported {len(created_items)} items',
                     'created_items': created_items,
                     'errors': errors
                 }
-                
+
                 if errors:
                     return Response(result, status=207)  # Partial success
                 return Response(result, status=201)
-                
+
             except UnicodeDecodeError:
                 return Response({'error': 'Invalid file encoding. Please use UTF-8 encoded CSV file.'}, status=400)
             except csv.Error as e:
                 return Response({'error': f'Invalid CSV format: {str(e)}'}, status=400)
             except Exception as e:
                 return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
-                
+
         except PermissionDenied as e:
             return Response({'error': str(e)}, status=403)
         except Exception as e:
             logger.error(f"Import CSV error: {str(e)}")
             return Response({'error': f'Unexpected error: {str(e)}'}, status=500)
-
-            
-
-
-
-
 
 class StorageBinViewSet(viewsets.ModelViewSet):
     serializer_class = StorageBinSerializer
@@ -296,18 +546,17 @@ class StorageBinViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         check_permission(self.request.user, page="storage_bins")
         queryset = StorageBin.objects.select_related('warehouse').prefetch_related(
-            'stock_records__item',  # This ensures item data is loaded efficiently
+            'stock_records__item',
             'stock_records__storage_bin'
         ).all().order_by('-created_at')
-        # Filter by warehouse if provided
         warehouse_id = self.request.query_params.get('warehouse_id')
         if warehouse_id:
             queryset = queryset.filter(warehouse_id=warehouse_id)
-            
+
         search = self.request.query_params.get('search', '').strip()
         if search:
             queryset = queryset.filter(
-                Q(bin_id__icontains=search) | 
+                Q(bin_id__icontains=search) |
                 Q(description__icontains=search) |
                 Q(warehouse__name__icontains=search)
             )
@@ -315,12 +564,10 @@ class StorageBinViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         check_permission(self.request.user, action="create_storage_bin")
-        
         warehouse = serializer.validated_data.get('warehouse')
         if warehouse:
             if warehouse.bins.count() >= warehouse.capacity:
                 raise PermissionDenied(f"Warehouse capacity exceeded. Maximum {warehouse.capacity} bins allowed.")
-        
         storage_bin = serializer.save(user=self.request.user)
         log_activity(
             user=self.request.user,
@@ -347,7 +594,6 @@ class StorageBinViewSet(viewsets.ModelViewSet):
         check_permission(self.request.user, action="delete_storage_bin")
         if instance.current_load > 0:
             raise PermissionDenied("Cannot delete bin with stock.")
-        
         bin_id = instance.bin_id
         instance.delete()
         log_activity(
@@ -358,6 +604,66 @@ class StorageBinViewSet(viewsets.ModelViewSet):
             object_name=bin_id,
             details={'deleted_bin': bin_id}
         )
+
+    @action(detail=True, methods=['post'], url_path='sync')
+    def sync_bin(self, request, pk=None):
+        try:
+            check_permission(request.user, action="update_storage_bin")
+            bin = get_object_or_404(StorageBin, id=pk, user=request.user)
+            valid_stock_records = StockRecord.objects.filter(
+                storage_bin=bin,
+                item__isnull=False
+            )
+            new_load = valid_stock_records.aggregate(total=Sum('quantity'))['total'] or 0
+
+            if bin.current_load != new_load:
+                bin.current_load = new_load
+                bin.save()
+                return Response({
+                    'message': 'Bin synced',
+                    'old_load': bin.current_load,
+                    'new_load': new_load
+                })
+            else:
+                return Response({'message': 'Bin already in sync'})
+        except Exception as e:
+            logger.error(f"Sync bin failed: {str(e)}")
+            return Response({'error': 'Operation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='move-to-warehouse')
+    def move_to_warehouse(self, request, pk=None):
+        try:
+            check_permission(request.user, action="update_storage_bin")
+            bin = self.get_object()
+            warehouse_id = request.data.get('warehouse_id')
+
+            if not warehouse_id:
+                return Response({'error': 'warehouse_id required'}, status=400)
+
+            try:
+                new_warehouse = Warehouse.objects.get(id=warehouse_id, user=request.user)
+            except Warehouse.DoesNotExist:
+                return Response({'error': 'Warehouse not found or not owned'}, status=404)
+
+            if new_warehouse.bins.count() >= new_warehouse.capacity:
+                return Response({'error': 'Target warehouse capacity exceeded'}, status=400)
+
+            with transaction.atomic():
+                bin.warehouse = new_warehouse
+                bin.save()
+                log_activity(
+                    user=request.user,
+                    action='update',
+                    model_name='StorageBin',
+                    object_id=bin.id,
+                    object_name=bin.bin_id,
+                    details={'moved_to_warehouse': new_warehouse.name}
+                )
+
+            return Response({'message': 'Bin moved successfully'})
+        except Exception as e:
+            logger.error(f"Move bin to warehouse failed: {str(e)}")
+            return Response({'error': 'Operation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class StockRecordViewSet(viewsets.ModelViewSet):
     serializer_class = StockRecordSerializer
@@ -375,13 +681,10 @@ class StockRecordViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         check_permission(self.request.user, action="create_stock_record")
         stock_record = serializer.save(user=self.request.user)
-        
         item = stock_record.item
         storage_bin = stock_record.storage_bin
-        
         storage_bin.current_load = (storage_bin.current_load or 0) + stock_record.quantity
         storage_bin.save()
-        
         log_activity(
             user=self.request.user,
             action='create',
@@ -399,20 +702,16 @@ class StockRecordViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         check_permission(self.request.user, action="delete_stock_record")
-        
         item = instance.item
         storage_bin = instance.storage_bin
         quantity = instance.quantity
         record_id = instance.id
         item_name = item.name if item else 'Unknown Item'
         bin_id = storage_bin.bin_id if storage_bin else 'Unknown Bin'
-        
         if storage_bin:
             storage_bin.current_load = max(0, (storage_bin.current_load or 0) - quantity)
             storage_bin.save()
-        
         instance.delete()
-        
         log_activity(
             user=self.request.user,
             action='delete',
@@ -507,12 +806,11 @@ class ExpiryTrackedItemViewSet(viewsets.ModelViewSet):
         queryset = ExpiryTrackedItem.objects.filter(
             expiry_date__lt=timezone.now().date()
         ).select_related('item', 'user').order_by('-expiry_date')
-        
         search = self.request.query_params.get('search', '').strip()
         if search:
             queryset = queryset.filter(
-                Q(item__name__icontains=search) | 
-                Q(item__part_number__icontains=search) | 
+                Q(item__name__icontains=search) |
+                Q(item__part_number__icontains=search) |
                 Q(batch__icontains=search)
             )
         return queryset
@@ -572,14 +870,12 @@ class StockInView(APIView):
         logger.error(f"Stock In failed: {serializer.errors}")
         return Response(serializer.errors, status=400)
 
-# inventory/views.py
 class StockOutView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
         check_permission(request.user, action="stock_out")
         check_permission(request.user, action="create_warehouse_receipt")
-
         serializer = StockOutSerializer(data=request.data, context={'request': request})
         if serializer.is_valid():
             stock_movement = serializer.save()
@@ -593,18 +889,14 @@ class StockOutView(APIView):
                     "message": "Stock removed successfully, but receipt creation failed",
                     "stock_movement_id": stock_movement.id
                 }, status=status.HTTP_201_CREATED)
-
             return Response({
                 "message": "Stock removed successfully",
                 "stock_movement_id": stock_movement.id,
                 "receipt_id": receipt.id,
                 "receipt_number": receipt.receipt_number
             }, status=status.HTTP_201_CREATED)
-        
         logger.error(f"Stock Out failed: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
 
 class AnalyticsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -617,18 +909,14 @@ class AnalyticsView(APIView):
             total_in=Sum('quantity', filter=Q(movement_type='IN')),
             total_out=Sum('quantity', filter=Q(movement_type='OUT'))
         )
-        
         total_stock = StockRecord.objects.aggregate(total=Sum('quantity'))['total'] or 0
         turnover_rate = (movements['total_out'] or 0) / (total_stock or 1)
-
         bin_usage = StorageBin.objects.annotate(
             movement_count=Count('movements')
         ).order_by('-movement_count')[:5].values('bin_id', 'movement_count')
-
         alerts_over_time = InventoryAlert.objects.filter(
             created_at__gte=timezone.now() - timezone.timedelta(days=30)
         ).values('alert_type').annotate(count=Count('id'))
-
         data = {
             "turnover_rate": round(turnover_rate, 2),
             "most_used_bins": list(bin_usage),
@@ -677,16 +965,20 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         check_permission(self.request.user, action="delete_warehouse")
-        if instance.bins.exists():
-            raise PermissionDenied("Cannot delete warehouse with assigned bins.")
-        
+        bins = instance.bins.all()
+        if bins.exists():
+            return Response({
+                'error': 'Cannot delete warehouse with bins.',
+                'bin_count': bins.count(),
+                'bin_ids': list(bins.values_list('id', flat=True))
+            }, status=status.HTTP_400_BAD_REQUEST)
         warehouse_name = instance.name
         instance.delete()
         log_activity(
             user=self.request.user,
             action='delete',
             model_name='Warehouse',
-            object_id=instance.id,
+            object_id=None,  # Already deleted
             object_name=warehouse_name,
             details={'deleted_warehouse': warehouse_name}
         )
@@ -702,13 +994,11 @@ class WarehouseViewSet(viewsets.ModelViewSet):
     def add_bin(self, request, pk=None):
         warehouse = self.get_object()
         check_permission(request.user, action="create_storage_bin")
-        
         if warehouse.bins.count() >= warehouse.capacity:
             return Response(
                 {"error": f"Warehouse capacity exceeded. Maximum {warehouse.capacity} bins allowed."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
         serializer = StorageBinSerializer(data=request.data, context={'request': request})
         if serializer.is_valid():
             storage_bin = serializer.save(warehouse=warehouse, user=request.user)
@@ -733,16 +1023,13 @@ class WarehouseAnalyticsView(APIView):
     def get(self, request, warehouse_id=None):
         try:
             check_permission(request.user, page="aisle_rack_dashboard")
-            
             bins = StorageBin.objects.select_related('warehouse')
             if warehouse_id:
                 bins = bins.filter(warehouse_id=warehouse_id)
                 warehouse = Warehouse.objects.get(id=warehouse_id)
             else:
                 warehouse = None
-            
             total_bins = bins.count()
-            
             if total_bins == 0:
                 return Response({
                     'total_bins': 0,
@@ -766,7 +1053,6 @@ class WarehouseAnalyticsView(APIView):
                     },
                     'message': 'No storage bins found'
                 })
-            
             from django.db.models import Case, When, FloatField, F, Q
             bins = bins.annotate(
                 usage_pct=Case(
@@ -775,7 +1061,6 @@ class WarehouseAnalyticsView(APIView):
                     output_field=FloatField()
                 )
             )
-
             aggregation = bins.aggregate(
                 total_capacity=Sum('capacity'),
                 total_used=Sum('current_load'),
@@ -784,23 +1069,19 @@ class WarehouseAnalyticsView(APIView):
                 medium_usage=Count('id', filter=Q(usage_pct__gte=20, usage_pct__lt=80)),
                 high_usage=Count('id', filter=Q(usage_pct__gte=80))
             )
-            
             total_capacity = aggregation['total_capacity'] or 0
             total_used = aggregation['total_used'] or 0
             empty_bins = aggregation['empty']
             loaded_bins = total_bins - empty_bins
-            
             usage_distribution = {
                 'empty': empty_bins,
                 'low_usage': aggregation['low_usage'],
                 'medium_usage': aggregation['medium_usage'],
                 'high_usage': aggregation['high_usage']
             }
-            
             utilization_percentage = 0
             if total_capacity > 0:
                 utilization_percentage = round((total_used / total_capacity) * 100, 2)
-            
             if warehouse:
                 warehouse_info = {
                     'name': warehouse.name,
@@ -816,7 +1097,6 @@ class WarehouseAnalyticsView(APIView):
                 total_warehouse_capacity = Warehouse.objects.aggregate(
                     total_capacity=Sum('capacity')
                 )['total_capacity'] or 0
-                
                 warehouse_info = {
                     'name': 'All Warehouses',
                     'capacity': total_warehouse_capacity,
@@ -824,7 +1104,6 @@ class WarehouseAnalyticsView(APIView):
                     'available_capacity': total_warehouse_capacity - total_warehouse_used,
                     'usage_percentage': round((total_warehouse_used / total_warehouse_capacity * 100), 2) if total_warehouse_capacity > 0 else 0
                 }
-            
             analytics_data = {
                 'total_bins': total_bins,
                 'total_capacity': total_capacity,
@@ -836,9 +1115,7 @@ class WarehouseAnalyticsView(APIView):
                 'usage_distribution': usage_distribution,
                 'warehouse_id': warehouse_id
             }
-            
             return Response(analytics_data)
-            
         except Exception as e:
             logger.error(f"Error in WarehouseAnalyticsView: {str(e)}")
             return Response({
@@ -850,14 +1127,11 @@ class InventoryActivityLogViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = InventoryActivityLogSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StandardResultsSetPagination
-    
+
     def get_queryset(self):
         check_permission(self.request.user, page="inventory_activity_logs")
         queryset = InventoryActivityLog.objects.select_related('user').order_by('-timestamp')
         return queryset
-
-
-
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
@@ -868,18 +1142,13 @@ def get_unique_states(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_unique_countries(request):
-    """Return list of unique non-empty countries from warehouses."""
     countries = Warehouse.objects.exclude(country='').values_list('country', flat=True).distinct().order_by('country')
     return Response(list(countries))
-
-
 
 @login_required
 def warehouse_receipt_print(request, receipt_id):
     receipt = get_object_or_404(WarehouseReceipt, id=receipt_id)
     return render(request, 'inventory/receipt_print.html', {'receipt': receipt})
-
-
 
 class WarehouseReceiptPDFView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -892,7 +1161,6 @@ class WarehouseReceiptPDFView(APIView):
                 'item',
                 'created_by'
             ).get(id=receipt_id, created_by=request.user)
-
             buffer = BytesIO()
             doc = SimpleDocTemplate(
                 buffer,
@@ -904,8 +1172,6 @@ class WarehouseReceiptPDFView(APIView):
             )
             elements = []
             styles = getSampleStyleSheet()
-
-            # --- Custom paragraph styles (keeps using ParagraphStyle available in your snippet) ---
             title_style = ParagraphStyle(
                 'ReceiptTitle', parent=styles['Heading1'],
                 fontSize=16, alignment=1, spaceAfter=8, leading=20,
@@ -920,15 +1186,10 @@ class WarehouseReceiptPDFView(APIView):
                 'SmallInfo', parent=styles['Normal'],
                 fontSize=9, leading=12, textColor=colors.black
             )
-
-            # === Header Section ===
-            # Company Logo (if exists)
             if hasattr(settings, 'COMPANY_LOGO_PATH'):
                 try:
                     from reportlab.platypus import Image
                     logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.5*inch, height=0.8*inch)
-
-                    # header with ash-gray left block, large middle title area, right metadata
                     header_table = Table([[
                         logo_img,
                         Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b><br/><span>{getattr(settings, 'COMPANY_TAGLINE', '')}</span>", styles['Title']),
@@ -938,11 +1199,10 @@ class WarehouseReceiptPDFView(APIView):
                             small_info
                         )
                     ]], colWidths=[1.5*inch, 3.8*inch, 2.2*inch])
-
                     header_table.setStyle(TableStyle([
-                        ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),  # ash block behind logo
-                        ('BACKGROUND', (1, 0), (1, 0), colors.white),               # white center
-                        ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")), # light ash metadata bg
+                        ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
+                        ('BACKGROUND', (1, 0), (1, 0), colors.white),
+                        ('BACKGROUND', (2, 0), (2, 0), colors.HexColor("#F6F6F6")),
                         ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
                         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                         ('ALIGN', (2, 0), (2, 0), 'RIGHT'),
@@ -956,7 +1216,6 @@ class WarehouseReceiptPDFView(APIView):
                     elements.append(Spacer(1, 12))
                 except Exception as e:
                     logger.warning(f"Logo not found or failed to load: {str(e)}")
-                    # Fallback to text-only header with ash band
                     header_table = Table([[
                         Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b>", styles['Title']),
                         Paragraph(
@@ -980,7 +1239,6 @@ class WarehouseReceiptPDFView(APIView):
                     elements.append(header_table)
                     elements.append(Spacer(1, 12))
             else:
-                # No logo path - still render styled header
                 header_table = Table([[
                     Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', '')}</b>", styles['Title']),
                     Paragraph(
@@ -1003,12 +1261,8 @@ class WarehouseReceiptPDFView(APIView):
                 ]))
                 elements.append(header_table)
                 elements.append(Spacer(1, 12))
-
-            # === Receipt Title ===
             elements.append(Paragraph("WAREHOUSE STOCK OUT RECEIPT", title_style))
             elements.append(Spacer(1, 8))
-
-            # === Receipt Number & Date (refined visual grid) ===
             header_data = [
                 ["Receipt No.", receipt.receipt_number],
                 ["Date", receipt.created_at.strftime('%d/%m/%Y %H:%M')],
@@ -1028,8 +1282,6 @@ class WarehouseReceiptPDFView(APIView):
             ]))
             elements.append(header_table)
             elements.append(Spacer(1, 12))
-
-            # === Item Details Section ===
             elements.append(Paragraph("<b>ITEM DETAILS</b>", section_heading))
             elements.append(Spacer(1, 6))
             item_data = [
@@ -1047,13 +1299,11 @@ class WarehouseReceiptPDFView(APIView):
                 ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#FAFAFA")),
                 ('LEFTPADDING', (0, 0), (-1, -1), 8),
                 ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADING', (0, 0), (-1, -1), 6),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
             ]))
             elements.append(item_table)
             elements.append(Spacer(1, 12))
-
-            # === Location & Delivery Section ===
             elements.append(Paragraph("<b>LOCATION & DELIVERY</b>", section_heading))
             elements.append(Spacer(1, 6))
             location_data = [
@@ -1078,8 +1328,6 @@ class WarehouseReceiptPDFView(APIView):
             ]))
             elements.append(location_table)
             elements.append(Spacer(1, 12))
-
-            # === Quantities Section ===
             elements.append(Paragraph("<b>QUANTITIES</b>", section_heading))
             elements.append(Spacer(1, 6))
             qty_data = [
@@ -1100,8 +1348,6 @@ class WarehouseReceiptPDFView(APIView):
             ]))
             elements.append(qty_table)
             elements.append(Spacer(1, 12))
-
-            # === Signatures Section ===
             elements.append(Paragraph("<b>SIGNATURES</b>", section_heading))
             elements.append(Spacer(1, 6))
             signature_data = [
@@ -1122,8 +1368,6 @@ class WarehouseReceiptPDFView(APIView):
             ]))
             elements.append(signature_table)
             elements.append(Spacer(1, 18))
-
-            # === Footer Note (dark subtle band) ===
             footer_table = Table([[
                 Paragraph("<i>This document is auto-generated. Signatures are required for validation.</i>", styles['Italic']),
                 Paragraph(f"{getattr(settings, 'COMPANY_NAME', '')}", small_info)
@@ -1139,28 +1383,18 @@ class WarehouseReceiptPDFView(APIView):
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
             ]))
             elements.append(footer_table)
-
-            # Build PDF
             doc.build(elements)
-
-            # Set filename based on item name
             item_name_safe = receipt.item.name.replace(' ', '_').replace('/', '-') if receipt.item else "Item"
             filename = f"{item_name_safe}_kenyon_receipt.pdf"
-
             buffer.seek(0)
             response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
             response['Content-Disposition'] = f'attachment; filename="{filename}"'
             return response
-
         except WarehouseReceipt.DoesNotExist:
             return Response({'error': 'Receipt not found'}, status=404)
         except Exception as e:
             logger.error(f"PDF generation error: {str(e)}")
             return Response({'error': 'Failed to generate PDF'}, status=500)
-
-
-
-
 
 class WarehouseReceiptViewSet(viewsets.ModelViewSet):
     serializer_class = WarehouseReceiptSerializer
@@ -1177,3 +1411,5 @@ class WarehouseReceiptViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         check_permission(self.request.user, action="delete_warehouse_receipt")
         instance.delete()
+
+

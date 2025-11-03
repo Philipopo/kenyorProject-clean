@@ -15,6 +15,10 @@ def generate_material_id():
     # Generate a random 6-digit number (100000 to 999999)
     return str(random.randint(100000, 999999))
 
+def generate_warehouse_uid():
+    # Generate a random 6-digit number (100000 to 999999)
+    return str(random.randint(100000, 999999))
+
 class Item(models.Model):
     material_id = models.CharField(max_length=6, unique=True, editable=False, null=True)
     name = models.CharField(max_length=255)
@@ -29,6 +33,7 @@ class Item(models.Model):
     custom_fields = models.JSONField(default=dict, blank=True)
     user = models.ForeignKey('accounts.User', on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
+    po_number = models.CharField(max_length=100, blank=True, null=True, help_text="Purchase Order number")
 
     def total_quantity(self):
         if self.pk:  # Only query stock_records if the item has been saved
@@ -118,15 +123,21 @@ class Warehouse(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
-    
+    warehouse_uid = models.CharField(max_length=6, unique=True, editable=False, blank=True, null=True)
 
     def clean(self):
         if self.capacity <= 0:
             raise ValidationError("Capacity must be a positive number.")
-        
 
     def save(self, *args, **kwargs):
+        if not self.warehouse_uid:
+            for _ in range(10):
+                uid = generate_warehouse_uid()
+                if not Warehouse.objects.filter(warehouse_uid=uid).exists():
+                    self.warehouse_uid = uid
+                    break
+            else:
+                raise RuntimeError("Failed to generate unique warehouse UID")
         self.full_clean()
         super().save(*args, **kwargs)
 
@@ -150,15 +161,6 @@ class Warehouse(models.Model):
         if self.capacity == 0:
             return 0
         return round((self.used_capacity / self.capacity) * 100, 2)
-
-    def clean(self):
-        """Validate that capacity is positive"""
-        if self.capacity <= 0:
-            raise ValidationError("Capacity must be a positive number.")
-
-    def save(self, *args, **kwargs):
-        self.full_clean()
-        super().save(*args, **kwargs)
 
 class StorageBin(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='bins')
@@ -353,10 +355,11 @@ class InventoryActivityLog(models.Model):
         ('stock_out', 'Stock Out'),
     ]
     
+
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='inventory_activities')
     action = models.CharField(max_length=20, choices=ACTION_CHOICES)
     model_name = models.CharField(max_length=50)
-    object_id = models.PositiveIntegerField()
+    object_id = models.PositiveIntegerField(null=True, blank=True)
     object_name = models.CharField(max_length=255, blank=True)
     details = models.JSONField(default=dict, blank=True)
     timestamp = models.DateTimeField(auto_now_add=True)
@@ -369,9 +372,6 @@ class InventoryActivityLog(models.Model):
     def __str__(self):
         user_name = self.user.name if self.user and self.user.name else (self.user.email if self.user else 'Unknown')
         return f"{user_name} {self.action} {self.model_name} {self.object_name} at {self.timestamp}"
-
-
-
 
 def generate_receipt_number():
     date_str = timezone.now().strftime("%Y%m%d")
@@ -389,8 +389,6 @@ class WarehouseReceipt(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     stock_movement = models.ForeignKey(StockMovement, on_delete=models.CASCADE, null=True, blank=True)
     old_material_no = models.CharField(max_length=100, null=True, blank=True)
-
-    # Client-specific fields (from your image)
     delivery_to = models.CharField(max_length=255, blank=True)
     transfer_order_no = models.CharField(max_length=100, blank=True)
     plant_site = models.CharField(max_length=100, blank=True)

@@ -4,10 +4,16 @@ from .views import (
     WarehouseViewSet, WarehouseAnalyticsView,
     StorageBinViewSet, ItemViewSet, StockRecordViewSet,
     StockMovementViewSet, InventoryAlertViewSet, ExpiryTrackedItemViewSet,
-    StockInView, StockOutView, InventoryMetricsView, AnalyticsView, InventoryActivityLogViewSet, ImportCSVView, get_unique_states,
-    get_unique_countries, warehouse_receipt_print, WarehouseReceiptPDFView, WarehouseReceiptViewSet
+    StockInView, StockOutView, InventoryMetricsView, AnalyticsView,
+    InventoryActivityLogViewSet, ImportCSVView, get_unique_states,
+    get_unique_countries, warehouse_receipt_print, WarehouseReceiptPDFView,
+    WarehouseReceiptViewSet, BulkDeleteItemsView
 )
+import logging
 
+logger = logging.getLogger(__name__)
+
+# Router
 router = DefaultRouter()
 router.register('warehouses', WarehouseViewSet, basename='warehouses')
 router.register('bins', StorageBinViewSet, basename='bins')
@@ -19,9 +25,16 @@ router.register('expiry-tracked-items', ExpiryTrackedItemViewSet, basename='expi
 router.register('activity-logs', InventoryActivityLogViewSet, basename='activity-logs')
 router.register('receipts', WarehouseReceiptViewSet, basename='receipts')
 
+# Log router URLs
+logger.info(f"Registered router URLs: {router.urls}")
+
+app_name = 'inventory'
+
 urlpatterns = [
-    path('items/import-csv/', ImportCSVView.as_view(), name='import-items-csv'),  # ADD THIS LINE
     path('', include(router.urls)),
+    path('items/bulk-delete/', ItemViewSet.as_view({'post': 'bulk_delete'}), name='item-bulk-delete'),
+    path('items/bulk-delete-alt/', BulkDeleteItemsView.as_view(), name='item-bulk-delete-alt'),
+    path('items/import-csv/', ImportCSVView.as_view(), name='import-items-csv'),
     path('metrics/', InventoryMetricsView.as_view(), name='inventory-metrics'),
     path('stock-in/', StockInView.as_view(), name='stock-in'),
     path('stock-out/', StockOutView.as_view(), name='stock-out'),

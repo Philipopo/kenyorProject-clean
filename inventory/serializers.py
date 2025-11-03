@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.db import transaction
 from .models import Warehouse, StorageBin, Item, StockRecord, StockMovement, InventoryAlert, ExpiryTrackedItem, InventoryActivityLog, WarehouseReceipt
 import logging
-from django.utils import timezone  # Add this import
+from django.utils import timezone
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,10 @@ class WarehouseSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'code', 'description', 'address', 'city', 'state', 'country',
             'capacity', 'is_active', 'total_bins', 'used_capacity', 'available_capacity',
-            'usage_percentage', 'user', 'created_by', 'created_at', 'updated_at', 'bin_locations'
+            'usage_percentage', 'user', 'created_by', 'created_at', 'updated_at', 'bin_locations',
+            'warehouse_uid'
         ]
-        read_only_fields = ['user', 'created_at', 'updated_at']
+        read_only_fields = ['user', 'created_at', 'updated_at', 'warehouse_uid']
 
     def get_created_by(self, obj):
         if obj.user:
@@ -62,7 +63,7 @@ class ItemSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'material_id', 'name', 'description', 'part_number', 'manufacturer', 'contact', 'batch', 'expiry_date',
             'min_stock_level', 'reserved_quantity', 'custom_fields', 'user', 'created_at',
-            'total_quantity', 'available_quantity', 'created_by'
+            'total_quantity', 'available_quantity', 'created_by', 'po_number'
         ]
         read_only_fields = ['id', 'material_id', 'user', 'created_at', 'total_quantity', 'available_quantity', 'created_by']
 
@@ -201,8 +202,6 @@ class StorageBinSerializer(serializers.ModelSerializer):
         
         return data
 
-
-
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
     material_id = serializers.CharField(source='item.material_id', read_only=True)
@@ -225,7 +224,6 @@ class StockMovementSerializer(serializers.ModelSerializer):
                 return obj.user.name
             return obj.user.email
         return '—'
-
 
 class InventoryAlertSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='related_item.name', read_only=True, allow_null=True)
@@ -306,9 +304,6 @@ class StockInSerializer(serializers.Serializer):
             )
 
             logger.info(f"Stock In: {quantity} of {item.name} ({item.material_id}) to {storage_bin.bin_id} by {self.context['request'].user.email}")
-
-
-
 
 class StockOutSerializer(serializers.Serializer):
     item_id = serializers.IntegerField()
@@ -398,7 +393,6 @@ class StockOutSerializer(serializers.Serializer):
                     'Unknown Recipient'
                 )
             receipt = WarehouseReceipt.objects.create(
-                receipt_number=generate_receipt_number(),
                 issued_from_warehouse=storage_bin.warehouse,
                 issued_from_bin=storage_bin,
                 item=item,
@@ -443,142 +437,6 @@ class StockOutSerializer(serializers.Serializer):
                 f"{storage_bin.bin_id} by {self.context['request'].user.email}"
             )
             return stock_movement
-
-
-class StockOutSerializer(serializers.Serializer):
-    item_id = serializers.IntegerField()
-    storage_bin_id = serializers.IntegerField()
-    quantity = serializers.IntegerField(min_value=1)
-    notes = serializers.CharField(max_length=255, required=False, allow_blank=True)
-    recipient = serializers.CharField(max_length=255, required=False, allow_blank=True)
-
-    def validate(self, data):
-        try:
-            item = Item.objects.select_related('user').get(id=data['item_id'])
-            storage_bin = StorageBin.objects.select_related('warehouse').get(id=data['storage_bin_id'])
-        except Item.DoesNotExist:
-            raise serializers.ValidationError("Invalid item_id.")
-        except StorageBin.DoesNotExist:
-            raise serializers.ValidationError("Invalid storage_bin_id.")
-
-        stock_record = StockRecord.objects.filter(item=item, storage_bin=storage_bin).first()
-        if not stock_record or stock_record.quantity < data['quantity']:
-            available = stock_record.quantity if stock_record else 0
-            InventoryAlert.objects.create(
-                user=self.context['request'].user,
-                alert_type='CRITICAL',
-                message=f"Cannot remove {data['quantity']} of {item.name} ({item.material_id}) from bin {storage_bin.bin_id}: insufficient stock (available: {available}).",
-                related_bin=storage_bin,
-                related_item=item
-            )
-            raise serializers.ValidationError(
-                f"Insufficient stock in bin {storage_bin.bin_id}. Available: {available}, requested: {data['quantity']}."
-            )
-
-        available = item.available_quantity()
-        if data['quantity'] > available:
-            InventoryAlert.objects.create(
-                user=self.context['request'].user,
-                alert_type='WARNING',
-                message=f"Requested quantity {data['quantity']} exceeds available stock ({available}) for {item.name} ({item.material_id}) due to reservations.",
-                related_item=item
-            )
-            raise serializers.ValidationError(
-                f"Requested quantity exceeds available stock ({available}) due to reservations."
-            )
-
-        data['item'] = item
-        data['storage_bin'] = storage_bin
-        data['stock_record'] = stock_record
-        return data
-
-    def save(self):
-        with transaction.atomic():
-            item = self.validated_data['item']
-            storage_bin = self.validated_data['storage_bin']
-            quantity = self.validated_data['quantity']
-            stock_record = self.validated_data['stock_record']
-            notes = self.validated_data.get('notes', '')
-            recipient = self.validated_data.get('recipient', '')
-
-            # Update stock record
-            stock_record.quantity -= quantity
-            if stock_record.quantity == 0:
-                stock_record.delete()
-            else:
-                stock_record.save()
-
-            # Update bin's current load
-            storage_bin.current_load = max(0, storage_bin.current_load - quantity)
-
-            # Ensure storage_bin has a warehouse
-            if not storage_bin.warehouse:
-                warehouse, created = Warehouse.objects.get_or_create(
-                    user=self.context['request'].user,
-                    name="Default Warehouse",
-                    code="WH-DEFAULT",
-                    defaults={'capacity': 1000}
-                )
-                storage_bin.warehouse = warehouse
-                storage_bin.save()
-                logger.info(f"Assigned default warehouse to bin {storage_bin.bin_id}")
-
-            storage_bin.save()
-
-            # Create warehouse receipt first (omit receipt_number, let model generate it)
-            if not recipient:
-                recipient = notes if notes else (
-                    self.context['request'].user.name or
-                    self.context['request'].user.email or
-                    'Unknown Recipient'
-                )
-            receipt = WarehouseReceipt.objects.create(
-                issued_from_warehouse=storage_bin.warehouse,
-                issued_from_bin=storage_bin,
-                item=item,
-                quantity=quantity,
-                recipient=recipient,
-                purpose=notes or f"Stock out for {item.name}",
-                created_by=self.context['request'].user,
-                delivery_to=recipient,
-                transfer_order_no=f"TO-{item.id}-{timezone.now().strftime('%Y%m%d%H%M%S')}",  # Temporary unique ID
-                plant_site=storage_bin.warehouse.code,
-                bin_location=storage_bin.bin_id,
-                qty_picked=quantity,
-                qty_remaining=item.available_quantity(),
-                unloading_point='Default Unloading Point',
-                picker=self.context['request'].user.name or self.context['request'].user.email,
-                controller='N/A'
-            )
-            logger.info(
-                f"Warehouse Receipt {receipt.receipt_number} created for stock out: "
-                f"{quantity} of {item.name} ({item.material_id}) from {storage_bin.bin_id} "
-                f"by {self.context['request'].user.email}"
-            )
-
-            # Create stock movement with linked receipt
-            stock_movement = StockMovement.objects.create(
-                user=self.context['request'].user,
-                item=item,
-                storage_bin=storage_bin,
-                movement_type='OUT',
-                quantity=quantity,
-                notes=notes,
-                warehouse_receipt=receipt
-            )
-
-            # Update receipt with stock movement
-            receipt.stock_movement = stock_movement
-            receipt.transfer_order_no = f"TO-{stock_movement.id}"  # Update with final stock movement ID
-            receipt.save()
-
-            logger.info(
-                f"Stock Out: {quantity} of {item.name} ({item.material_id}) from "
-                f"{storage_bin.bin_id} by {self.context['request'].user.email}"
-            )
-            return stock_movement
-
-
 
 class InventoryActivityLogSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source='user.name', read_only=True)
@@ -588,7 +446,6 @@ class InventoryActivityLogSerializer(serializers.ModelSerializer):
         model = InventoryActivityLog
         fields = '__all__'
         read_only_fields = ['user', 'timestamp']
-
 
 class WarehouseReceiptSerializer(serializers.ModelSerializer):
     class Meta:
