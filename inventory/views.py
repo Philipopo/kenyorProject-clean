@@ -1,4 +1,5 @@
 import csv
+import uuid
 from django.conf import settings
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
@@ -250,17 +251,31 @@ class ItemViewSet(viewsets.ModelViewSet):
                 'SmallInfo', parent=styles['Normal'],
                 fontSize=9, leading=12, textColor=colors.black
             )
+            # Style for wrapped table cells
+            cell_style = ParagraphStyle(
+                'TableCell',
+                parent=styles['Normal'],
+                fontSize=9,
+                leading=11,
+                wordWrap='CJK'  # Enables wrapping for long words
+            )
 
-            # Header with logo (if available), company name, and date
+            # --- HEADER (aligned with WarehouseReceiptPDFView) ---
             from datetime import datetime
             current_date = datetime.now().strftime('%d/%m/%Y %H:%M')
+            report_number = f"IR-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
             if hasattr(settings, 'COMPANY_LOGO_PATH'):
                 try:
                     logo_img = Image(settings.COMPANY_LOGO_PATH, width=1.5*inch, height=0.8*inch)
                     header_table = Table([[
                         logo_img,
                         Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}</b><br/><span>{getattr(settings, 'COMPANY_TAGLINE', '')}</span>", styles['Title']),
-                        Paragraph(f"<b>Date</b><br/>{current_date}", small_info)
+                        Paragraph(
+                            f"<b>Report No.</b><br/>{report_number}<br/><br/>"
+                            f"<b>Date</b><br/>{current_date}",
+                            small_info
+                        )
                     ]], colWidths=[1.5*inch, 3.8*inch, 2.2*inch])
                     header_table.setStyle(TableStyle([
                         ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
@@ -280,7 +295,11 @@ class ItemViewSet(viewsets.ModelViewSet):
                     logger.warning(f"Logo not found or failed to load: {str(e)}")
                     header_table = Table([[
                         Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}</b>", styles['Title']),
-                        Paragraph(f"<b>Date</b><br/>{current_date}", small_info)
+                        Paragraph(
+                            f"<b>Report No.</b><br/>{report_number}<br/><br/>"
+                            f"<b>Date</b><br/>{current_date}",
+                            small_info
+                        )
                     ]], colWidths=[5.0*inch, 2.2*inch])
                     header_table.setStyle(TableStyle([
                         ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
@@ -298,7 +317,11 @@ class ItemViewSet(viewsets.ModelViewSet):
             else:
                 header_table = Table([[
                     Paragraph(f"<b>{getattr(settings, 'COMPANY_NAME', 'Kenyon Inventory')}</b>", styles['Title']),
-                    Paragraph(f"<b>Date</b><br/>{current_date}", small_info)
+                    Paragraph(
+                        f"<b>Report No.</b><br/>{report_number}<br/><br/>"
+                        f"<b>Date</b><br/>{current_date}",
+                        small_info
+                    )
                 ]], colWidths=[5.0*inch, 2.2*inch])
                 header_table.setStyle(TableStyle([
                     ('BACKGROUND', (0, 0), (0, 0), colors.HexColor("#B2B2B2")),
@@ -308,7 +331,7 @@ class ItemViewSet(viewsets.ModelViewSet):
                     ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
                     ('LEFTPADDING', (0, 0), (-1, -1), 8),
                     ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-                    ('TOPPADING', (0, 0), (-1, -1), 10),
+                    ('TOPPADDING', (0, 0), (-1, -1), 10),
                     ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
                     ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#D0D0D0")),
                 ]))
@@ -321,27 +344,31 @@ class ItemViewSet(viewsets.ModelViewSet):
             # Item table
             elements.append(Paragraph("<b>ITEMS</b>", section_heading))
             elements.append(Spacer(1, 6))
-            item_data = [["ID", "Material ID", "Name", "po_number", "min_stock"]]
+            item_data = [["ID", "Material ID", "Name", "PO Number", "Min Stock", "Total Qty"]]
             for item in items:
                 item_data.append([
                     str(item.id),
                     item.material_id or "—",
-                    item.name or "—",
+                    Paragraph(item.name or "—", cell_style),  # ✅ Wrapped
                     item.po_number or "—",
-                    item.min_stock_level or "—"
+                    str(item.min_stock_level) if item.min_stock_level is not None else "—",
+                    str(item.total_quantity())  # ✅ Calculated total
                 ])
-            item_table = Table(item_data, colWidths=[0.5*inch, 1.0*inch, 1.5*inch, 1.0*inch, 1.5*inch, 2.0*inch])
+
+            # Adjusted column widths to accommodate 6 columns
+            item_table = Table(item_data, colWidths=[0.5*inch, 0.9*inch, 1.8*inch, 1.0*inch, 0.8*inch, 0.9*inch])
             item_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                 ('GRID', (0, 0), (-1, -1), 0.35, colors.HexColor("#E0E0E0")),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F3F3F3")),  # Header row
-                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#FAFAFA")),  # Data rows
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#F3F3F3")),  # Header
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#FAFAFA")),  # Data
                 ('LEFTPADDING', (0, 0), (-1, -1), 8),
                 ('RIGHTPADDING', (0, 0), (-1, -1), 8),
                 ('TOPPADDING', (0, 0), (-1, -1), 6),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('WORDWRAP', (2, 1), (2, -1), 'CJK'),  # Only wrap Name column
             ]))
             elements.append(item_table)
             elements.append(Spacer(1, 18))
@@ -371,7 +398,6 @@ class ItemViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"PDF export error: {str(e)}")
             return Response({'error': 'Failed to generate PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 
 
 class BulkDeleteItemsView(APIView):
