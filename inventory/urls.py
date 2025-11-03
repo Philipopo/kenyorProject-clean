@@ -31,10 +31,14 @@ logger.info(f"Registered router URLs: {router.urls}")
 app_name = 'inventory'
 
 urlpatterns = [
-    path('', include(router.urls)),
+ 
+    path('items/import-csv/', ImportCSVView.as_view(), name='import-items-csv'),
     path('items/bulk-delete/', ItemViewSet.as_view({'post': 'bulk_delete'}), name='item-bulk-delete'),
     path('items/bulk-delete-alt/', BulkDeleteItemsView.as_view(), name='item-bulk-delete-alt'),
-    path('items/import-csv/', ImportCSVView.as_view(), name='import-items-csv'),
+
+    path('', include(router.urls)),
+
+ 
     path('metrics/', InventoryMetricsView.as_view(), name='inventory-metrics'),
     path('stock-in/', StockInView.as_view(), name='stock-in'),
     path('stock-out/', StockOutView.as_view(), name='stock-out'),
