@@ -115,6 +115,7 @@ class ItemViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(
                 Q(name__icontains=search) |
                 Q(part_number__icontains=search) |
+                Q(material_class__icontains=search) |
                 Q(material_id__icontains=search)
             )
         return queryset
@@ -503,6 +504,7 @@ class ImportCSVView(APIView):
                             'name': row['name'].strip(),
                             'description': row.get('description', '').strip(),
                             'part_number': row['part_number'].strip(),
+                            'material_class': row['material_class'].strip(),
                             'manufacturer': row['manufacturer'].strip(),
                             'contact': row['contact'].strip(),
                             'min_stock_level': int(row.get('min_stock_level', 0)) if row.get('min_stock_level') else 0,

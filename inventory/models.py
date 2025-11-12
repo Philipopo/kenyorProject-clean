@@ -24,6 +24,7 @@ class Item(models.Model):
     name = models.CharField(max_length=255)
     description = models.CharField(max_length=500, null=True, blank=True)
     part_number = models.CharField(max_length=100, unique=True)
+    material_class = models.CharField(max_length=100, unique=True, null=True, blank=True)
     manufacturer = models.CharField(max_length=255)
     contact = models.CharField(max_length=255)
     batch = models.CharField(max_length=100, blank=True)
