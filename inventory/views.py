@@ -116,7 +116,8 @@ class ItemViewSet(viewsets.ModelViewSet):
                 Q(name__icontains=search) |
                 Q(part_number__icontains=search) |
                 Q(material_class__icontains=search) |
-                Q(material_id__icontains=search)
+                Q(material_id__icontains=search) |
+                Q(serial_number__icontains=search)
             )
         return queryset
 
@@ -345,19 +346,20 @@ class ItemViewSet(viewsets.ModelViewSet):
             # Item table
             elements.append(Paragraph("<b>ITEMS</b>", section_heading))
             elements.append(Spacer(1, 6))
-            item_data = [["ID", "Material ID", "Name", "PO Number", "Min Stock", "Total Qty"]]
+            item_data = [["ID", "Material ID", "Name", "PO Number", "Serial Number", "Min Stock", "Total Qty"]]
             for item in items:
                 item_data.append([
                     str(item.id),
                     item.material_id or "—",
                     Paragraph(item.name or "—", cell_style),  # ✅ Wrapped
                     item.po_number or "—",
+                    item.serial_number or "—",
                     str(item.min_stock_level) if item.min_stock_level is not None else "—",
                     str(item.total_quantity())  # ✅ Calculated total
                 ])
 
-            # Adjusted column widths to accommodate 6 columns
-            item_table = Table(item_data, colWidths=[0.5*inch, 0.9*inch, 1.8*inch, 1.0*inch, 0.8*inch, 0.9*inch])
+            # Adjusted column widths to accommodate 7 columns
+            item_table = Table(item_data, colWidths=[0.5*inch, 0.9*inch, 1.6*inch, 1.0*inch, 1.0*inch, 0.8*inch, 0.9*inch])
             item_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
@@ -522,6 +524,8 @@ class ImportCSVView(APIView):
                             item_data['expiry_date'] = row['expiry_date'].strip()
                         if row.get('po_number'):
                             item_data['po_number'] = row['po_number'].strip()
+                        if row.get('serial_number'):
+                            item_data['serial_number'] = row['serial_number'].strip()
 
                         # Create the item
                         item = Item.objects.create(

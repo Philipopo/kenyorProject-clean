@@ -63,7 +63,7 @@ class ItemSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'material_id', 'name', 'description', 'part_number', 'material_class', 'manufacturer', 'contact', 'batch', 'expiry_date',
             'min_stock_level', 'reserved_quantity', 'custom_fields', 'user', 'created_at',
-            'total_quantity', 'available_quantity', 'created_by', 'po_number'
+            'total_quantity', 'available_quantity', 'created_by', 'po_number', 'serial_number'
         ]
         read_only_fields = ['id', 'material_id', 'user', 'created_at', 'total_quantity', 'available_quantity', 'created_by']
 
