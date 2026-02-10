@@ -3,7 +3,7 @@ from .models import Item, StorageBin, StockRecord, StockMovement, InventoryAlert
 
 @admin.register(Item)
 class ItemAdmin(admin.ModelAdmin):
-    list_display = ('name', 'part_number', 'serial_number', 'material_class', 'total_quantity', 'available_quantity', 'created_at')
+    list_display = ('name', 'part_number', 'serial_number', 'material_class', 'naira_cost', 'dollar_cost', 'manufacturing_date', 'total_quantity', 'available_quantity', 'created_at')
     search_fields = ('name', 'part_number', 'serial_number')
 
 @admin.register(StorageBin)

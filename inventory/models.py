@@ -36,6 +36,9 @@ class Item(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     po_number = models.CharField(max_length=100, blank=True, null=True, help_text="Purchase Order number")
     serial_number = models.CharField(max_length=100, blank=True, null=True)
+    naira_cost = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
+    dollar_cost = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
+    manufacturing_date = models.DateField(null=True, blank=True)
 
     def total_quantity(self):
         if self.pk:  # Only query stock_records if the item has been saved

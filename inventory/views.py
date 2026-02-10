@@ -1,5 +1,6 @@
 import csv
 import uuid
+import decimal
 from django.conf import settings
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
@@ -30,6 +31,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from rest_framework.permissions import IsAuthenticated
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +111,7 @@ class ItemViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         check_permission(self.request.user, page="items")
-        queryset = Item.objects.all().order_by('-id')
+        queryset = Item.objects.all().order_by('name')
         search = self.request.query_params.get('search', '').strip()
         if search:
             queryset = queryset.filter(
@@ -346,7 +348,7 @@ class ItemViewSet(viewsets.ModelViewSet):
             # Item table
             elements.append(Paragraph("<b>ITEMS</b>", section_heading))
             elements.append(Spacer(1, 6))
-            item_data = [["ID", "Material ID", "Name", "PO Number", "Serial Number", "Min Stock", "Total Qty"]]
+            item_data = [["ID", "Material ID", "Name", "PO Number", "Serial Number", "Naira Cost", "Dollar Cost", "Mfg Date", "Min Stock", "Total Qty"]]
             for item in items:
                 item_data.append([
                     str(item.id),
@@ -354,12 +356,16 @@ class ItemViewSet(viewsets.ModelViewSet):
                     Paragraph(item.name or "—", cell_style),  # ✅ Wrapped
                     item.po_number or "—",
                     item.serial_number or "—",
+                    str(item.naira_cost) if item.naira_cost is not None else "—",
+                    str(item.dollar_cost) if item.dollar_cost is not None else "—",
+                    item.manufacturing_date.strftime('%d/%m/%Y') if item.manufacturing_date else "—",
                     str(item.min_stock_level) if item.min_stock_level is not None else "—",
                     str(item.total_quantity())  # ✅ Calculated total
                 ])
 
-            # Adjusted column widths to accommodate 7 columns
-            item_table = Table(item_data, colWidths=[0.5*inch, 0.9*inch, 1.6*inch, 1.0*inch, 1.0*inch, 0.8*inch, 0.9*inch])
+            # Adjusted column widths to accommodate 10 columns
+            col_widths = [0.5*inch, 0.9*inch, 1.6*inch, 1.0*inch, 1.0*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.9*inch]
+            item_table = Table(item_data, colWidths=col_widths, splitByRow=True)
             item_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
@@ -371,7 +377,7 @@ class ItemViewSet(viewsets.ModelViewSet):
                 ('RIGHTPADDING', (0, 0), (-1, -1), 8),
                 ('TOPPADDING', (0, 0), (-1, -1), 6),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                ('WORDWRAP', (2, 1), (2, -1), 'CJK'),  # Only wrap Name column
+                ('WORDWRAP', (0, 0), (-1, -1), 'CJK'),  # Wrap all cells
             ]))
             elements.append(item_table)
             elements.append(Spacer(1, 18))
@@ -401,8 +407,9 @@ class ItemViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"PDF export error: {str(e)}")
             return Response({'error': 'Failed to generate PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
 
-
+        
 class BulkDeleteItemsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -521,11 +528,39 @@ class ImportCSVView(APIView):
                         if row.get('batch'):
                             item_data['batch'] = row['batch'].strip()
                         if row.get('expiry_date'):
-                            item_data['expiry_date'] = row['expiry_date'].strip()
+                            expiry_str = row['expiry_date'].strip()
+                            try:
+                                # Try DD/MM/YYYY first
+                                expiry_date = datetime.strptime(expiry_str, '%d/%m/%Y').date()
+                            except ValueError:
+                                try:
+                                    # Fallback to YYYY-MM-DD
+                                    expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
+                                except ValueError:
+                                    errors.append(f"Row {row_num}: Invalid expiry_date format (use DD/MM/YYYY or YYYY-MM-DD)")
+                                    continue
+                            item_data['expiry_date'] = expiry_date
                         if row.get('po_number'):
                             item_data['po_number'] = row['po_number'].strip()
                         if row.get('serial_number'):
                             item_data['serial_number'] = row['serial_number'].strip()
+                        if row.get('naira_cost'):
+                            item_data['naira_cost'] = decimal.Decimal(row['naira_cost'].strip())
+                        if row.get('dollar_cost'):
+                            item_data['dollar_cost'] = decimal.Decimal(row['dollar_cost'].strip())
+                        if row.get('manufacturing_date'):
+                            mfg_str = row['manufacturing_date'].strip()
+                            try:
+                                # Try DD/MM/YYYY first
+                                mfg_date = datetime.strptime(mfg_str, '%d/%m/%Y').date()
+                            except ValueError:
+                                try:
+                                    # Fallback to YYYY-MM-DD
+                                    mfg_date = datetime.strptime(mfg_str, '%Y-%m-%d').date()
+                                except ValueError:
+                                    errors.append(f"Row {row_num}: Invalid manufacturing_date format (use DD/MM/YYYY or YYYY-MM-DD)")
+                                    continue
+                            item_data['manufacturing_date'] = mfg_date
 
                         # Create the item
                         item = Item.objects.create(
@@ -1443,5 +1478,4 @@ class WarehouseReceiptViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         check_permission(self.request.user, action="delete_warehouse_receipt")
         instance.delete()
-
 
