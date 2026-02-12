@@ -358,6 +358,7 @@ class ItemViewSet(viewsets.ModelViewSet):
                     item.serial_number or "—",
                     str(item.naira_cost) if item.naira_cost is not None else "—",
                     str(item.dollar_cost) if item.dollar_cost is not None else "—",
+                    str(item.weight) if item.weight is not None else "—",
                     item.manufacturing_date.strftime('%d/%m/%Y') if item.manufacturing_date else "—",
                     str(item.min_stock_level) if item.min_stock_level is not None else "—",
                     str(item.total_quantity())  # ✅ Calculated total
@@ -543,6 +544,8 @@ class ImportCSVView(APIView):
                             item_data['serial_number'] = row['serial_number'].strip()
                         if row.get('naira_cost'):
                             item_data['naira_cost'] = decimal.Decimal(row['naira_cost'].strip())
+                        if row.get('weight'):
+                            item_data['weight'] = decimal.Decimal(row['weight'].strip())
                         if row.get('dollar_cost'):
                             item_data['dollar_cost'] = decimal.Decimal(row['dollar_cost'].strip())
                         if row.get('manufacturing_date'):
