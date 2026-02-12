@@ -39,11 +39,12 @@ class Item(models.Model):
     naira_cost = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
     dollar_cost = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
     manufacturing_date = models.DateField(null=True, blank=True)
+    initial_quantity = models.PositiveIntegerField(default=0, blank=True)
 
     def total_quantity(self):
         if self.pk:  # Only query stock_records if the item has been saved
-            return self.stock_records.aggregate(total=Sum('quantity'))['total'] or 0
-        return 0
+            return self.initial_quantity + (self.stock_records.aggregate(total=Sum('quantity'))['total'] or 0)
+        return self.initial_quantity
 
     def available_quantity(self):
         if self.pk:

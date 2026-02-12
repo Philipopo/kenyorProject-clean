@@ -365,7 +365,7 @@ class ItemViewSet(viewsets.ModelViewSet):
 
             # Adjusted column widths to accommodate 10 columns
             col_widths = [0.5*inch, 0.9*inch, 1.6*inch, 1.0*inch, 1.0*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.9*inch]
-            item_table = Table(item_data, colWidths=col_widths, splitByRow=True)
+            item_table = Table(item_data, colWidths=col_widths)
             item_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
@@ -377,7 +377,7 @@ class ItemViewSet(viewsets.ModelViewSet):
                 ('RIGHTPADDING', (0, 0), (-1, -1), 8),
                 ('TOPPADDING', (0, 0), (-1, -1), 6),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                ('WORDWRAP', (0, 0), (-1, -1), 'CJK'),  # Wrap all cells
+                ('WORDWRAP', (2, 1), (2, -1), 'CJK'),  # Only wrap Name column
             ]))
             elements.append(item_table)
             elements.append(Spacer(1, 18))
@@ -407,9 +407,7 @@ class ItemViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"PDF export error: {str(e)}")
             return Response({'error': 'Failed to generate PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
 
-        
 class BulkDeleteItemsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -513,11 +511,10 @@ class ImportCSVView(APIView):
                             'name': row['name'].strip(),
                             'description': row.get('description', '').strip(),
                             'part_number': row['part_number'].strip(),
-                            'material_class': row['material_class'].strip(),
+                            'material_class': row.get('material_class', '').strip(),
                             'manufacturer': row['manufacturer'].strip(),
                             'contact': row['contact'].strip(),
                             'min_stock_level': int(row.get('min_stock_level', 0)) if row.get('min_stock_level') else 0,
-                            'reserved_quantity': int(row.get('reserved_quantity', 0)) if row.get('reserved_quantity') else 0,
                             'custom_fields': {
                                 'Material': row.get('material', '').strip(),
                                 'Grade': row.get('grade', '').strip()
@@ -561,6 +558,8 @@ class ImportCSVView(APIView):
                                     errors.append(f"Row {row_num}: Invalid manufacturing_date format (use DD/MM/YYYY or YYYY-MM-DD)")
                                     continue
                             item_data['manufacturing_date'] = mfg_date
+                        if row.get('initial_quantity'):
+                            item_data['initial_quantity'] = int(row['initial_quantity'])
 
                         # Create the item
                         item = Item.objects.create(
@@ -964,7 +963,8 @@ class StockOutView(APIView):
             }, status=status.HTTP_201_CREATED)
         logger.error(f"Stock Out failed: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
+    
+    
 class AnalyticsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
